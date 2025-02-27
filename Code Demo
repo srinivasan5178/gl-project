@@ -1,0 +1,442 @@
+import os
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import Dense, Dropout, Concatenate, BatchNormalization, GlobalAveragePooling2D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import mixed_precision
+from tensorflow.keras import regularizers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.preprocessing.image import ImageDataGenerator  # Data augmentation
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+
+# Clear GPU Memory Between Runs
+from tensorflow.keras import backend as K
+K.clear_session()
+
+# Enable mixed precision to handle large models with lower memory usage
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
+
+
+# Dataset directory
+dataset_dir = "/content/Project_Sample"  # Replace with the actual path to your directory
+
+#num_classes=5
+
+# Define the FusionDataGenerator class
+class FusionDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, colon_gen, lung_gen, batch_size, steps_per_epoch, num_classes=5):  # Changed num_classes to 4
+        self.colon_gen = colon_gen
+        self.lung_gen = lung_gen
+        self.batch_size = batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.colon_iterator = iter(self.colon_gen)  # Create iterator for colon_gen
+        self.lung_iterator = iter(self.lung_gen)    # Create iterator for lung_gen
+        self.num_classes = num_classes  # Store the number of classes
+
+    def __len__(self):
+        return self.steps_per_epoch  # Number of steps per epoch
+
+    def __getitem__(self, index):
+        try:
+            # Get the next batch from both iterators
+            colon_batch = next(self.colon_iterator)
+            lung_batch = next(self.lung_iterator)
+
+            colon_images, colon_labels = colon_batch
+            lung_images, lung_labels = lung_batch
+
+            # Ensure consistent batch size for combined images and labels
+            assert colon_images.shape[0] == self.batch_size, f"Shape mismatch in colon images: {colon_images.shape[0]}"
+            assert lung_images.shape[0] == self.batch_size, f"Shape mismatch in lung images: {lung_images.shape[0]}"
+
+            # Return the two separate batches of images (colon and lung) and the separate labels
+            return (tf.convert_to_tensor(colon_images, dtype=tf.float32),
+                    tf.convert_to_tensor(lung_images, dtype=tf.float32)), \
+                   (tf.convert_to_tensor(colon_labels, dtype=tf.int32),
+                    tf.convert_to_tensor(lung_labels, dtype=tf.int32))
+
+        except StopIteration:
+            # Reset iterators when reaching the end of an epoch
+            self._reset_iterators()
+            return self.__getitem__(index)  # Recursively call __getitem__ to get the next batch
+
+    def _reset_iterators(self):
+        self.colon_iterator = iter(self.colon_gen)
+        self.lung_iterator = iter(self.lung_gen)
+
+
+# Data generator functions
+
+# Data generator functions
+#Data generator functions
+def create_data_generator_colon(dataset_dir, batch_size):
+    colon_datagen = ImageDataGenerator(rescale=1./255,
+                                       rotation_range=40,
+                                       width_shift_range=0.2,
+                                       height_shift_range=0.2,
+                                       shear_range=0.2,
+                                       zoom_range=0.2,
+                                       horizontal_flip=True,
+                                       fill_mode='nearest')
+
+    colon_train_gen = colon_datagen.flow_from_directory(
+        dataset_dir,
+        target_size=(64, 64),  # Resize to 64x64
+        batch_size=batch_size,
+        class_mode='sparse', # Changed to sparse
+        classes=['colon_aca', 'colon_n'],
+        shuffle=True
+    )
+
+    return colon_train_gen
+
+def create_data_generator_lung(dataset_dir, batch_size):
+    lung_datagen = ImageDataGenerator(rescale=1./255,
+                                      rotation_range=40,
+                                      width_shift_range=0.2,
+                                      height_shift_range=0.2,
+                                      shear_range=0.2,
+                                      zoom_range=0.2,
+                                      horizontal_flip=True,
+                                      fill_mode='nearest')
+
+    lung_train_gen = lung_datagen.flow_from_directory(
+        dataset_dir,
+        target_size=(64, 64),  # Resize to 64x64
+        batch_size=batch_size,
+        class_mode='sparse', # Changed to sparse
+        classes=['lung_aca', 'lung_n', 'lung_scc'],
+        shuffle=True
+    )
+
+    return lung_train_gen
+
+# Base model creation functions with fine-tuning
+def create_base_model1(input_shape=(64, 64, 3), output_dim=128):
+    base_model_colon = tf.keras.applications.DenseNet201(weights='imagenet', include_top=False, input_shape=input_shape)
+    for layer in base_model_colon.layers[:400]:
+        layer.trainable = False
+
+    x = base_model_colon.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dropout(0.5)(x)
+    x = Dense(output_dim, activation='relu')(x)  # Add a Dense layer to match output size
+    return Model(inputs=base_model_colon.input, outputs=x)
+
+def create_base_model2(input_shape=(64, 64, 3), output_dim=128):
+    base_model_lung = tf.keras.applications.ResNet152(weights='imagenet', include_top=False, input_shape=input_shape)
+    for layer in base_model_lung.layers[:400]:
+        layer.trainable = False
+
+    y = base_model_lung.output
+    y = GlobalAveragePooling2D()(y)
+    y = Dropout(0.5)(y)
+    y = Dense(output_dim, activation='relu')(y)  # Add a Dense layer to match output size
+    return Model(inputs=base_model_lung.input, outputs=y)
+
+
+# Build the model with predefined best hyperparameters
+def build_model(dense1_units=512, dropout_rate=0.2, learning_rate=0.0003176, num_classes=5):  # Changed num_classes to 4
+    img_size_colon = (64, 64, 3)
+    img_size_lung = (64, 64, 3)
+
+    colon_input = Input(shape=img_size_colon, name='colon_input')
+    lung_input = Input(shape=img_size_lung, name='lung_input')
+
+    base_model_colon = create_base_model1(img_size_colon, output_dim=128)
+    base_model_lung = create_base_model2(img_size_lung, output_dim=128)
+
+    colon_features = base_model_colon(colon_input)
+    lung_features = base_model_lung(lung_input)
+
+    # Concatenate features from both models
+    concatenated_features = Concatenate(axis=1)([colon_features, lung_features])
+    normalized_features = BatchNormalization()(concatenated_features)
+
+    # Dense layers with predefined hyperparameters
+    dense1 = Dense(dense1_units, activation='relu', kernel_regularizer=regularizers.l2(0.001))(normalized_features)
+    dense1 = Dropout(dropout_rate)(dense1)
+    dense1 = BatchNormalization()(dense1)
+
+    dense2 = Dense(256, activation='relu')(dense1)
+    dense2 = BatchNormalization()(dense2)
+
+    dense3 = Dense(128, activation='relu')(dense2)
+
+    # Final output layer
+    #output = Dense(num_classes, activation='softmax')(dense3)
+
+    output = Dense(5, activation='softmax')(dense3)
+
+    model = Model(inputs=[colon_input, lung_input], outputs=output)
+
+    # Compile the model with predefined learning rate
+    model.compile(optimizer=Adam(learning_rate=learning_rate),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+
+    return model
+
+
+# Instantiate data generators for training and validation
+#batch_size = 8
+#steps_per_epoch = 5
+#num_classes = 5  # Changed num_classes to 4
+
+# Create FusionDataGenerator for training (70%)
+#train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size, steps_per_epoch, num_classes=num_classes)
+
+# Instantiate data generators for training and validation
+batch_size = 8
+steps_per_epoch = 5
+num_classes = 5  # Changed num_classes to 4
+
+# Call the data generator functions and assign their output to the respective variables
+#colon_train_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon_image_sets"), batch_size)
+#lung_train_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung_image_sets"), batch_size)
+
+colon_train_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon"), batch_size)
+lung_train_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung"), batch_size)
+
+# Create FusionDataGenerator for training (70%)
+train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size, steps_per_epoch, num_classes=num_classes)
+
+# Create data generators for validation (15%)
+colon_val_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon"), batch_size)
+lung_val_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung"), batch_size)
+val_gen = FusionDataGenerator(colon_val_gen, lung_val_gen, batch_size, steps_per_epoch, num_classes=num_classes)
+
+# Create data generators for testing (15%)
+colon_test_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon"), batch_size)
+lung_test_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung"), batch_size)
+test_gen = FusionDataGenerator(colon_test_gen, lung_test_gen, batch_size, steps_per_epoch, num_classes=num_classes)
+
+# Build the model with predefined best values
+best_model = build_model(dense1_units=512, dropout_rate=0.2, learning_rate=0.0003176, num_classes=num_classes)  ## bease hyperband value
+
+# Train the model
+early_stopping = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
+
+
+#class_weight_dict = {i: class_weights[i] for i in range(len(class_weights))}
+
+history = best_model.fit(
+   x=train_gen,
+   epochs=2,  # Number of epochs
+   validation_data=val_gen,
+   callbacks=[early_stopping, reduce_lr],
+   verbose=1
+)
+
+
+
+
+# Save the trained model
+best_model.save('best_model.keras')  # Save the entire model
+
+
+# Plot training and validation accuracy
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.show()
+
+import numpy as np
+from tensorflow.keras.models import Model
+
+def extract_features(generator, model, num_samples):
+    features = []
+    labels = []
+
+    # Create an iterator from the generator
+    generator_iterator = iter(generator)
+
+    # Create a feature extractor model from the passed in model
+    feature_extractor = Model(inputs=model.input, outputs=model.layers[-4].output)
+
+    # Using the generator iterator, iterate through the number of samples
+    for _ in range(num_samples):
+        try:
+            # Get the next batch
+            batch = next(generator_iterator)
+
+            # Check if it's from FusionDataGenerator or ImageDataGenerator
+            if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], tuple) and isinstance(batch[1], tuple):
+                (colon_images, lung_images), (colon_labels, lung_labels) = batch  # Handle FusionDataGenerator output
+
+                # Predict using both image sets, only extract features from base model
+                feature = feature_extractor.predict([colon_images, lung_images])
+
+                # Check feature shape before reshaping
+                print(f"Feature shape before reshaping: {feature.shape}")
+
+                # Reshape the features to 2D before appending
+                feature = feature.reshape(feature.shape[0], -1)  # Flatten the last two dimensions
+                features.append(feature)
+
+                # Combine labels, keeping colon labels [0,1] and lung labels as [2,3]
+                combined_labels = np.concatenate([colon_labels, lung_labels + 2])
+                labels.append(combined_labels)
+
+            elif isinstance(batch, tuple) and len(batch) == 2:  # Handle ImageDataGenerator output
+                images, label = batch
+
+                # Predict using the images, only extract features from base model
+                feature = feature_extractor.predict([images, np.zeros_like(images)])  # dummy lung input
+
+                # Check feature shape before reshaping
+                print(f"Feature shape before reshaping: {feature.shape}")
+
+                # Reshape the features to 2D before appending
+                feature = feature.reshape(feature.shape[0], -1)  # Flatten the last two dimensions
+                features.append(feature)
+                labels.append(label)  # Append label
+
+            else:
+                raise ValueError("Unexpected batch format from generator.")
+        except StopIteration:
+            # Handle end of generator
+            break
+
+    # Concatenate features and labels into numpy arrays
+    features = np.concatenate(features, axis=0)
+    labels = np.concatenate(labels, axis=0)
+
+    return features, labels
+
+
+
+
+# Extract features and labels from the colon and lung datasets
+#colon_train_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon_image_sets"), batch_size)
+#lung_train_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung_image_sets"), batch_size)
+
+
+colon_train_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon"), batch_size)
+lung_train_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung"), batch_size)
+
+# Specify number of samples to extract (ensure consistency)
+num_samples = 100  # Adjust this number to the number of samples you want to extract
+
+#colon_features, colon_labels = extract_features(colon_train_gen, best_model, num_samples=num_samples)
+#lung_features, lung_labels = extract_features(lung_train_gen, best_model, num_samples=num_samples)
+
+colon_features, colon_labels = extract_features(colon_train_gen, best_model, num_samples=num_samples)
+lung_features, lung_labels = extract_features(lung_train_gen, best_model, num_samples=num_samples)
+
+# Check the shape of the features and labels for consistency
+print(f"Colon Features Shape: {colon_features.shape}")
+print(f"Colon Labels Shape: {colon_labels.shape}")
+print(f"Lung Features Shape: {lung_features.shape}")
+print(f"Lung Labels Shape: {lung_labels.shape}")
+
+# Ensure that both feature arrays and label arrays have the same number of samples
+assert colon_features.shape[0] == colon_labels.shape[0], f"Mismatch in colon features and labels: {colon_features.shape[0]} vs {colon_labels.shape[0]}"
+assert lung_features.shape[0] == lung_labels.shape[0], f"Mismatch in lung features and labels: {lung_features.shape[0]} vs {lung_labels.shape[0]}"
+
+# Combine the features and labels from both datasets
+features = np.concatenate([colon_features, lung_features], axis=0)
+labels = np.concatenate([colon_labels, lung_labels], axis=0)
+
+# Check the shape of the combined features and labels
+print(f"Combined Features Shape: {features.shape}")
+print(f"Combined Labels Shape: {labels.shape}")
+
+# Split the data into training and validation sets
+X_train, X_val, y_train, y_val = train_test_split(features, labels, test_size=0.2, random_state=42)
+
+
+from sklearn.utils.class_weight import compute_class_weight
+
+# Reshape y_train to be a 1D array
+y_train_reshaped = y_train.reshape(-1)
+
+# Compute class weights using the reshaped array
+class_weights = compute_class_weight(
+    'balanced',
+    classes=np.unique(y_train_reshaped),
+    y=y_train_reshaped
+)
+
+# Train an XGBoost model with Hyperparameter Tuning
+xgb_model = xgb.XGBClassifier(
+    objective='multi:softmax',
+    num_class=5,
+    eval_metric='mlogloss',
+    max_depth=8,  # Chosen depth for the decision tree
+    learning_rate=0.1,  # Learning rate for boosting
+    n_estimators=500,  # Number of trees to train
+    subsample=0.7,  # Fraction of samples for training each tree
+    colsample_bytree=0.7,  # Fraction of features used for each tree
+    gamma=0.1  # Regularization parameter for trees
+)
+
+# Check the shape of the split data
+print(f"X_train Shape: {X_train.shape}")
+print(f"X_val Shape: {X_val.shape}")
+print(f"y_train Shape: {y_train.shape}")
+print(f"y_val Shape: {y_val.shape}")
+
+# Train an XGBoost model on the features
+#xgb_model = xgb.XGBClassifier(objective='multi:softmax', num_class=num_classes) # Changed num_classes to 4
+xgb_model.fit(X_train, y_train)
+
+# Evaluate the XGBoost model
+y_pred_xgb = xgb_model.predict(X_val)
+xgb_val_accuracy = xgb_model.score(X_val, y_val)
+print(f"XGBoost Validation Accuracy: {xgb_val_accuracy:.4f}")
+
+
+# Define the class names to class indices mapping
+class_mapping = {
+    'colon_aca': 0,
+    'colon_n': 1,
+    'lung_aca': 2,
+    'lung_n': 3,
+    'lung_scc': 4
+}
+
+# Get unique classes in y_val and y_pred_xgb
+unique_classes = np.unique(np.concatenate((y_val, y_pred_xgb)))
+
+# Get all the class names from class_mapping
+all_class_names = list(class_mapping.keys())
+
+# Filter class_mapping to include only the present classes in unique_classes
+present_class_mapping = [class_name for class_name in all_class_names if class_mapping[class_name] in unique_classes]
+
+# Ensure target_names match the present classes
+target_names = present_class_mapping if present_class_mapping else all_class_names
+
+# Print the final target names for verification
+#print(f"Final Target Names: {target_names}")
+
+
+# Ensure target_names always include all 5 classes
+target_names = list(class_mapping.keys())  # This includes all the class names from class_mapping
+
+# Print the final target names for verification
+print(f"Final Target Names: {target_names}")
+
+# Print classification report
+print(f"Classification Report:")
+print(classification_report(y_val, y_pred_xgb,
+                            target_names=target_names,
+                            labels=list(class_mapping.values()),  # Ensure all class indices are used
+                            zero_division=0))  # Handle zero division if needed
+
+# Create a confusion matrix for validation
+cm_val = confusion_matrix(y_val, y_pred_xgb, labels=list(class_mapping.values()))  # Use all class indices
+ConfusionMatrixDisplay(confusion_matrix=cm_val,
+                       display_labels=target_names).plot()  # Use all class names
+plt.title("Validation Confusion Matrix for XGBoost Model")
+plt.show()

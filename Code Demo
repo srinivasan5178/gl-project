@@ -12,6 +12,7 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator  # Data augm
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+from sklearn.utils.class_weight import compute_class_weight
 
 # Clear GPU Memory Between Runs
 from tensorflow.keras import backend as K
@@ -25,7 +26,6 @@ mixed_precision.set_global_policy(policy)
 # Dataset directory
 dataset_dir = "/content/Project_Sample"  # Replace with the actual path to your directory
 
-#num_classes=5
 
 # Define the FusionDataGenerator class
 class FusionDataGenerator(tf.keras.utils.Sequence):
@@ -73,7 +73,6 @@ class FusionDataGenerator(tf.keras.utils.Sequence):
 # Data generator functions
 
 # Data generator functions
-#Data generator functions
 def create_data_generator_colon(dataset_dir, batch_size):
     colon_datagen = ImageDataGenerator(rescale=1./255,
                                        rotation_range=40,
@@ -184,21 +183,9 @@ def build_model(dense1_units=512, dropout_rate=0.2, learning_rate=0.0003176, num
 
 
 # Instantiate data generators for training and validation
-#batch_size = 8
-#steps_per_epoch = 5
-#num_classes = 5  # Changed num_classes to 4
-
-# Create FusionDataGenerator for training (70%)
-#train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size, steps_per_epoch, num_classes=num_classes)
-
-# Instantiate data generators for training and validation
 batch_size = 8
 steps_per_epoch = 5
-num_classes = 5  # Changed num_classes to 4
-
-# Call the data generator functions and assign their output to the respective variables
-#colon_train_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon_image_sets"), batch_size)
-#lung_train_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung_image_sets"), batch_size)
+num_classes = 5  # Changed num_classes to 5
 
 colon_train_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon"), batch_size)
 lung_train_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung"), batch_size)
@@ -223,9 +210,6 @@ best_model = build_model(dense1_units=512, dropout_rate=0.2, learning_rate=0.000
 early_stopping = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
 reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
 
-
-#class_weight_dict = {i: class_weights[i] for i in range(len(class_weights))}
-
 history = best_model.fit(
    x=train_gen,
    epochs=2,  # Number of epochs
@@ -234,12 +218,8 @@ history = best_model.fit(
    verbose=1
 )
 
-
-
-
 # Save the trained model
 best_model.save('best_model.keras')  # Save the entire model
-
 
 # Plot training and validation accuracy
 plt.plot(history.history['accuracy'], label='Train Accuracy')
@@ -249,9 +229,6 @@ plt.xlabel('Epochs')
 plt.ylabel('Accuracy')
 plt.legend()
 plt.show()
-
-import numpy as np
-from tensorflow.keras.models import Model
 
 def extract_features(generator, model, num_samples):
     features = []
@@ -313,22 +290,11 @@ def extract_features(generator, model, num_samples):
 
     return features, labels
 
-
-
-
-# Extract features and labels from the colon and lung datasets
-#colon_train_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon_image_sets"), batch_size)
-#lung_train_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung_image_sets"), batch_size)
-
-
 colon_train_gen = create_data_generator_colon(os.path.join(dataset_dir, "colon"), batch_size)
 lung_train_gen = create_data_generator_lung(os.path.join(dataset_dir, "lung"), batch_size)
 
 # Specify number of samples to extract (ensure consistency)
 num_samples = 100  # Adjust this number to the number of samples you want to extract
-
-#colon_features, colon_labels = extract_features(colon_train_gen, best_model, num_samples=num_samples)
-#lung_features, lung_labels = extract_features(lung_train_gen, best_model, num_samples=num_samples)
 
 colon_features, colon_labels = extract_features(colon_train_gen, best_model, num_samples=num_samples)
 lung_features, lung_labels = extract_features(lung_train_gen, best_model, num_samples=num_samples)
@@ -353,7 +319,6 @@ print(f"Combined Labels Shape: {labels.shape}")
 
 # Split the data into training and validation sets
 X_train, X_val, y_train, y_val = train_test_split(features, labels, test_size=0.2, random_state=42)
-
 
 from sklearn.utils.class_weight import compute_class_weight
 

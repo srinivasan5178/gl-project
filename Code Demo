@@ -54,11 +54,20 @@ class FusionDataGenerator(tf.keras.utils.Sequence):
             assert colon_images.shape[0] == self.batch_size, f"Shape mismatch in colon images: {colon_images.shape[0]}"
             assert lung_images.shape[0] == self.batch_size, f"Shape mismatch in lung images: {lung_images.shape[0]}"
 
-            # Return the two separate batches of images (colon and lung) and the separate labels
+
+            # Adjust lung labels by adding an offset (to ensure no overlap)
+            lung_labels = lung_labels + 2  # Offset lung labels to avoid overlap with colon labels
+
+
+             # Combine labels using np.where to create a single target vector
+            combined_labels = np.where(colon_labels == 0, colon_labels, lung_labels)
+
+
+            # Return the two separate batches of images (colon and lung) and the combined labels
             return (tf.convert_to_tensor(colon_images, dtype=tf.float32),
                     tf.convert_to_tensor(lung_images, dtype=tf.float32)), \
-                   (tf.convert_to_tensor(colon_labels, dtype=tf.int32),
-                    tf.convert_to_tensor(lung_labels, dtype=tf.int32))
+                   tf.convert_to_tensor(combined_labels, dtype=tf.int32)  # Return a single label tensor
+
 
         except StopIteration:
             # Reset iterators when reaching the end of an epoch

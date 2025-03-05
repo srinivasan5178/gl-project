@@ -1,4 +1,4 @@
-# Name server connection check 
+# Name server connection check - Code
 import Pyro4
 
 # Set up Pyro4 configuration with ngrok details
@@ -17,7 +17,7 @@ except Pyro4.errors.NamingError as e:
 except Exception as e:
     print(f"An unexpected error occurred: {e}")
 
-# fixing the Test accarcy 040325 - TPR,FPR,AROUC
+# TPR,FPR,AROUC  - Code
 import Pyro4
 import ConfigSpace as CS
 import numpy as np
@@ -211,32 +211,6 @@ def plot_confusion_matrix(cm, class_names, model_catboost, train_features, train
     plt.show()
 
 
-# Function to calculate TPR, FPR, and AUC-ROC
-def calculate_roc_auc(y_true, y_pred_prob, class_names):
-    fpr, tpr, thresholds = roc_curve(y_true, y_pred_prob, pos_label=1)  # pos_label = 1 for binary classification
-    roc_auc = auc(fpr, tpr)
-
-    # TPR and FPR for the class of interest
-    tpr_value = tpr[-1]  # The last value in the tpr array corresponds to the final threshold
-    fpr_value = fpr[-1]  # The last value in the fpr array corresponds to the final threshold
-
-    print(f"TPR (Recall): {tpr_value:.4f}")
-    print(f"FPR: {fpr_value:.4f}")
-    print(f"AUC-ROC: {roc_auc:.4f}")
-
-    # Plot ROC curve
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic')
-    plt.legend(loc='lower right')
-    plt.show()
-
-
 # Objective function for BOHB optimization
 class CNNCatBoostWorker(Worker):
     def compute(self, config, budget, *args, **kwargs):
@@ -292,11 +266,15 @@ class CNNCatBoostWorker(Worker):
         catboost_train_time = end_catboost_train_time - start_catboost_train_time
 
         # Evaluate CatBoost performance
-        val_predictions = model_catboost.predict(val_features_split)
+        #val_predictions = model_catboost.predict(val_features_split)
+        #val_pred_prob = model_catboost.predict_proba(val_features_split)[:, 1]  # Get probabilities for ROC calculation
+
+        val_predictions = model_catboost.predict(val_features_split)  # Add this line to define val_predictions
         val_pred_prob = model_catboost.predict_proba(val_features_split)[:, 1]  # Get probabilities for ROC calculation
 
+
         # Calculate TPR, FPR, and AUC-ROC for validation data
-        calculate_roc_auc(val_labels_split, val_pred_prob, ['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc'])
+        #calculate_roc_auc(val_labels_split, val_pred_prob, ['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc'])
 
         # Evaluate metrics on validation and test data
         val_accuracy = accuracy_score(val_labels_split, val_predictions)
@@ -372,6 +350,86 @@ def print_metrics_table(result):
     # Print the table using the tabulate library with a grid format
     print(tabulate(rows, headers=headers, tablefmt="grid"))
 
+
+# TPT& FPR & ROC
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve, auc, precision_recall_curve
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.datasets import make_classification
+from imblearn.over_sampling import SMOTE  # For handling class imbalance if needed
+
+# Function to adjust threshold for classification
+def adjust_threshold(y_true, y_pred_prob, threshold=0.5):
+    # Convert probabilities to binary predictions based on the threshold
+    y_pred_bin = (y_pred_prob[:, 1] >= threshold).astype(int)
+
+    # Calculate confusion matrix and classification metrics
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred_bin).ravel()
+    tpr = tp / (tp + fn)  # True Positive Rate (Recall)
+    fpr = fp / (fp + tn)  # False Positive Rate
+    accuracy = (tp + tn) / (tp + fp + fn + tn)
+
+    return tpr, fpr, accuracy, y_pred_bin
+
+# Function to plot precision-recall curve
+def plot_precision_recall_curve(y_true, y_pred_prob):
+    precision, recall, _ = precision_recall_curve(y_true, y_pred_prob[:, 1])  # Assuming class 1 is positive class
+    plt.plot(recall, precision, color='b', label=f'Precision-Recall curve (area = {auc(recall, precision):.2f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall curve')
+    plt.legend(loc='best')
+    plt.show()
+
+# Function to plot ROC curve and AUC
+def plot_roc_curve(y_true, y_pred_prob):
+    fpr, tpr, _ = roc_curve(y_true, y_pred_prob[:, 1])  # Assuming class 1 is positive class
+    auc_score = auc(fpr, tpr)
+    plt.figure()
+    plt.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (AUC = {auc_score:.2f})')
+    plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc='lower right')
+    plt.show()
+
+# Sample data generation (assuming binary classification problem)
+X, y = make_classification(n_samples=1000, n_features=20, n_classes=2, random_state=42)
+
+# Split the data into training and test sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+# Handle class imbalance using SMOTE (Optional)
+smote = SMOTE(sampling_strategy='auto', random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+# Train a Logistic Regression model (you can replace this with any classifier)
+model = LogisticRegression(random_state=42)
+model.fit(X_train_res, y_train_res)
+
+# Get predicted probabilities for the test set
+y_pred_prob = model.predict_proba(X_test)
+
+# Adjust the threshold to balance between TPR and FPR
+threshold = 0.4  # Change this threshold value to adjust TPR/FPR balance
+tpr, fpr, accuracy, y_pred_bin = adjust_threshold(y_test, y_pred_prob, threshold)
+
+# Print adjusted performance metrics
+print(f"Adjusted TPR (Recall): {tpr:.4f}")
+print(f"Adjusted FPR: {fpr:.4f}")
+print(f"Accuracy: {accuracy:.4f}")
+
+# Plot the Precision-Recall and ROC curves for better evaluation
+plot_precision_recall_curve(y_test, y_pred_prob)
+plot_roc_curve(y_test, y_pred_prob)
+
+
+
+
 # Example usage:
 if __name__ == "__main__":
     # Instantiate the worker and define the hyperparameter space
@@ -382,3 +440,6 @@ if __name__ == "__main__":
     config = {'learning_rate': 0.001, 'dropout_rate': 0.3, 'weight_decay': 1e-5, 'depth': 10, 'iterations': 1000, 'lr_catboost': 0.1}
     result = worker.compute(config=config, budget=25)
     print(result)
+
+
+

@@ -1,0 +1,345 @@
+# TPR/FPR/AU-ROC - Test 050325
+import Pyro4
+import ConfigSpace as CS
+import numpy as np
+from hpbandster.core.worker import Worker
+from catboost import CatBoostClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+from sklearn.metrics import ConfusionMatrixDisplay, roc_curve, auc
+from tensorflow.keras import layers, models
+from tensorflow.keras.optimizers import Adam, SGD
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.utils import Sequence
+from tensorflow.keras.applications import DenseNet201, EfficientNetB7, EfficientNetV2M
+from tensorflow.keras.regularizers import l2
+import seaborn as sns
+import matplotlib.pyplot as plt
+import socket
+import time
+from tabulate import tabulate
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import label_binarize
+
+# Configure Pyro4 to use the remote nameserver (ngrok)
+Pyro4.config.NS_HOST = "6.tcp.ngrok.io"
+Pyro4.config.NS_PORT = 15899  # The ngrok port for the Pyro4 nameserver
+
+print(f"Pyro4 NS_HOST: {Pyro4.config.NS_HOST}")
+print(f"Pyro4 NS_PORT: {Pyro4.config.NS_PORT}")
+
+# Custom Data Generator to handle both datasets (colon and lung)
+class FusionDataGenerator(Sequence):
+    def __init__(self, colon_gen, lung_gen, batch_size, steps_per_epoch, num_classes=5, **kwargs):
+        super().__init__(**kwargs)  # Add this line
+        self.colon_gen = colon_gen
+        self.lung_gen = lung_gen
+        self.batch_size = batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.colon_iterator = iter(self.colon_gen)
+        self.lung_iterator = iter(self.lung_gen)
+        self.num_classes = num_classes
+        self.current_index = 0
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+    def __next__(self):
+        data = self.__getitem__(self.current_index)
+        self.current_index += 1
+        return data
+
+    def __iter__(self):
+        self.current_index = 0
+        return self
+
+    def _reset_iterators(self):
+        self.colon_iterator = iter(self.colon_gen)
+        self.lung_iterator = iter(self.lung_gen)
+        self.current_index = 0
+
+    def __getitem__(self, index):
+        try:
+            colon_batch = next(self.colon_iterator)
+            lung_batch = next(self.lung_iterator)
+
+            colon_images, colon_labels = colon_batch
+            lung_images, lung_labels = lung_batch
+
+            lung_labels = lung_labels + 2  # Adjust for correct range
+            images = np.concatenate([colon_images, lung_images], axis=0)
+            labels = np.concatenate([colon_labels, lung_labels], axis=0)
+
+            return (images, labels)
+
+        except StopIteration:
+            self._reset_iterators()
+            return self.__getitem__(index)
+
+
+# Data generator functions for Colon and Lung datasets
+def create_data_generator_colon(dataset_dir, batch_size):
+    colon_datagen = ImageDataGenerator(rescale=1./255,
+                                       rotation_range=40,
+                                       width_shift_range=0.2,
+                                       height_shift_range=0.2,
+                                       shear_range=0.2,
+                                       zoom_range=0.2,
+                                       horizontal_flip=True,
+                                       fill_mode='nearest',
+                                       brightness_range=[0.8, 1.2])  # Added brightness variation
+
+    colon_train_gen = colon_datagen.flow_from_directory(
+        dataset_dir,
+        target_size=(64, 64),  # EfficientNetV2L requires larger image size
+        batch_size=batch_size,
+        class_mode='sparse',
+        classes=['colon_aca', 'colon_n'],
+        shuffle=True
+    )
+    return colon_train_gen
+
+def create_data_generator_lung(dataset_dir, batch_size):
+    lung_datagen = ImageDataGenerator(rescale=1./255,
+                                      rotation_range=40,
+                                      width_shift_range=0.2,
+                                      height_shift_range=0.0,
+                                      shear_range=0.2,
+                                      zoom_range=0.2,
+                                      horizontal_flip=True,
+                                      fill_mode='nearest',
+                                      brightness_range=[0.8, 1.2])  # Added brightness variation
+
+    lung_train_gen = lung_datagen.flow_from_directory(
+        dataset_dir,
+        target_size=(64, 64),  # DenseNet201 requires larger image size
+        batch_size=batch_size,
+        class_mode='sparse',
+        classes=['lung_aca', 'lung_n', 'lung_scc'],
+        shuffle=True
+    )
+    return lung_train_gen
+
+
+# Build a custom CNN model from scratch using DenseNet201 for lung and EfficientNetV2L for colon
+def build_cnn_model(input_shape=(64, 64, 3), learning_rate=0.0003176, num_classes=5, dropout_rate=0.5, weight_decay=1e-4, dataset_type='lung'):
+    # Define a dictionary to map the dataset type to the base model
+    model_dict = {
+        'lung': DenseNet201,
+        'colon': EfficientNetV2L
+    }
+
+    # Choose the model based on the dataset type (avoiding elif)
+    base_model = model_dict.get(dataset_type)(weights='imagenet', include_top=False, input_shape=input_shape)
+
+    # Freeze base model layers (optional)
+    base_model.trainable = False
+
+    # Create the model
+    model = models.Sequential()
+    model.add(base_model)
+    model.add(layers.GlobalAveragePooling2D())  # Global pooling instead of flattening
+    model.add(layers.Dense(512, activation='relu', kernel_regularizer=l2(weight_decay)))  # L2 regularization
+    model.add(layers.Dropout(dropout_rate))  # Dropout for regularization
+    model.add(layers.Dense(256, activation='relu', kernel_regularizer=l2(weight_decay)))
+    model.add(layers.Dropout(dropout_rate))
+    model.add(layers.Dense(num_classes, activation='softmax'))  # For multi-class classification
+
+    # Compile the model
+    model.compile(optimizer=Adam(learning_rate=learning_rate),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+
+    return model
+
+
+# Define hyperparameter space for optimization
+def define_hyperparameter_space():
+    config_space = CS.ConfigurationSpace()
+
+    # Hyperparameters for CNN model
+    learning_rate = CS.CategoricalHyperparameter('learning_rate', [0.0001, 0.001, 0.01, 0.1])
+    dropout_rate = CS.UniformFloatHyperparameter('dropout_rate', 0.0, 0.5)
+    weight_decay = CS.UniformFloatHyperparameter('weight_decay', 1e-6, 1e-3)
+
+    # Hyperparameters for CatBoost model
+    depth = CS.UniformIntegerHyperparameter('depth', lower=10, upper=500)
+    iterations = CS.UniformIntegerHyperparameter('iterations', lower=100, upper=5000)
+    lr_catboost = CS.UniformFloatHyperparameter('lr_catboost', lower=0.01, upper=0.2)
+
+    config_space.add([learning_rate, dropout_rate, weight_decay, depth, iterations, lr_catboost])  # Error fix
+    return config_space
+
+
+def extract_features_from_cnn(model, generator, steps):
+    features = []
+    labels = []
+    for _ in range(steps):
+        batch_x, batch_y = next(generator)
+        batch_features = model.predict(batch_x)
+        features.append(batch_features)
+        labels.append(batch_y)
+    return np.concatenate(features), np.concatenate(labels)
+
+
+# Function to plot the confusion matrix
+def plot_confusion_matrix(cm, class_names):
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.show()
+
+
+def test_model_metrics(cnn_model, catboost_model, test_gen, class_names):
+    # Extract features from CNN model for testing
+    cnn_model.trainable = False  # Ensure CNN model is in inference mode
+    test_features, test_labels = extract_features_from_cnn(cnn_model, test_gen, steps=len(test_gen))
+
+    # Get predictions from CatBoost model
+    test_predictions = catboost_model.predict(test_features)
+    test_pred_prob = catboost_model.predict_proba(test_features)
+
+    # Calculate confusion matrix
+    cm = confusion_matrix(test_labels, test_predictions)
+
+    # Calculate precision, recall (TPR), and F1 score
+    precision = precision_score(test_labels, test_predictions, average='weighted')
+    recall = recall_score(test_labels, test_predictions, average='weighted')  # TPR
+    f1 = f1_score(test_labels, test_predictions, average='weighted')
+
+    # Calculate FPR (False Positive Rate) for each class
+    fpr = cm.sum(axis=0) - np.diag(cm)  # FP for each class
+    fpr = fpr / cm.sum(axis=0)  # FPR = FP / (FP + TN)
+
+    # Binarize labels for AUC-ROC calculation
+    test_labels_binarized = label_binarize(test_labels, classes=np.unique(test_labels))
+
+    # Calculate AUC-ROC
+    auc_score = roc_auc_score(test_labels_binarized, test_pred_prob, average='weighted', multi_class='ovr')
+
+    # Print results
+    print(f"Test Accuracy: {accuracy_score(test_labels, test_predictions)}")
+    print(f"Test Precision: {precision}")
+    print(f"Test Recall (TPR): {recall}")
+    print(f"Test F1: {f1}")
+    print(f"Test FPR: {fpr}")
+    print(f"Test AUC-ROC: {auc_score}")
+
+    # Optionally plot confusion matrix
+    plot_confusion_matrix(cm, class_names)
+
+    # Optionally plot ROC curve
+    fpr, tpr, _ = roc_curve(test_labels_binarized.ravel(), test_pred_prob.ravel())
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='b', label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc='lower right')
+    plt.show()
+
+    return cm, precision, recall, f1, fpr, auc_score
+
+
+# Objective function for BOHB optimization
+from sklearn.metrics import confusion_matrix
+
+class CNNCatBoostWorker(Worker):
+    def compute(self, config, budget, *args, **kwargs):
+        # Ensure correct dataset paths are used
+        colon_dataset_dir = '/content/Project_Sample/colon'
+        lung_dataset_dir = '/content/Project_Sample/lung'
+
+        # Extract hyperparameters
+        learning_rate = config['learning_rate']
+        dropout_rate = config['dropout_rate']
+        weight_decay = config['weight_decay']
+        depth = config['depth']
+        iterations = config['iterations']
+        lr_catboost = config['lr_catboost']
+
+        # Create data generators
+        colon_train_gen = create_data_generator_colon(colon_dataset_dir, batch_size=8)
+        lung_train_gen = create_data_generator_lung(lung_dataset_dir, batch_size=8)
+
+        # Create FusionDataGenerator for training and validation
+        train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)
+        val_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)  # Use same generators for val
+
+        # Create and compile CNN model
+        cnn_model = build_cnn_model(input_shape=(64, 64, 3), learning_rate=learning_rate, num_classes=5, dropout_rate=dropout_rate, weight_decay=weight_decay)
+
+        # Implement learning rate scheduling
+        lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+
+        # **Training**
+        start_train_time = time.time()  # Start training time
+        history = cnn_model.fit(train_gen, epochs=70, validation_data=val_gen, steps_per_epoch=5, validation_steps=5, callbacks=[lr_scheduler], verbose=0)  # Epoc set
+        end_train_time = time.time()  # End training time
+        train_time = end_train_time - start_train_time
+
+        # Model evaluation on validation data
+        val_loss, val_acc = cnn_model.evaluate(val_gen)
+
+        # Initialize CatBoost model
+        model_catboost = CatBoostClassifier(iterations=iterations, learning_rate=lr_catboost, depth=depth)
+
+        # Extract features from CNN model for CatBoost training
+        cnn_model.trainable = False
+        train_features_cnn, train_labels_cnn = extract_features_from_cnn(cnn_model, train_gen, steps=5)
+
+        # Train CatBoost model
+        model_catboost.fit(train_features_cnn, train_labels_cnn)
+
+        # Validation results from CatBoost
+        val_features_cnn, val_labels_cnn = extract_features_from_cnn(cnn_model, val_gen, steps=5)
+        val_predictions = model_catboost.predict(val_features_cnn)
+
+        # Calculate confusion matrix
+        cm = confusion_matrix(val_labels_cnn, val_predictions)
+
+        # Calculate accuracy
+        accuracy = accuracy_score(val_labels_cnn, val_predictions)
+
+        # Calculate precision, recall, and F1 score
+        precision = precision_score(val_labels_cnn, val_predictions, average='weighted')
+        recall = recall_score(val_labels_cnn, val_predictions, average='weighted')
+        f1 = f1_score(val_labels_cnn, val_predictions, average='weighted')
+
+        # Calculate TPR (Recall) and FPR (False Positive Rate) for each class
+        tpr = recall  # TPR is the same as Recall
+        fpr = cm.sum(axis=0) - np.diag(cm) / cm.sum(axis=0)  # FPR calculation
+
+        # Evaluate on test data
+        cm, precision, recall, f1, fpr, auc_score = test_model_metrics(cnn_model, model_catboost, val_gen, class_names=['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc'])
+
+        return {
+            'loss': 1 - auc_score,  # Minimizing the negative AUC-ROC score as an example
+            'status': 'ok',
+            'metrics': {
+                'confusion_matrix': cm,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'fpr': fpr,
+                'auc': auc_score,
+                'train_time': train_time
+            }
+        }
+
+
+# Example usage:
+if __name__ == "__main__":
+    # Instantiate the worker and define the hyperparameter space
+    worker = CNNCatBoostWorker(run_id="worker_1")
+    config_space = define_hyperparameter_space()
+
+    # Test the worker's computation method
+    config = {'learning_rate': 0.001, 'dropout_rate': 0.3, 'weight_decay': 1e-5, 'depth': 10, 'iterations': 1000, 'lr_catboost': 0.1}
+    result = worker.compute(config=config, budget=25)
+    print(result)

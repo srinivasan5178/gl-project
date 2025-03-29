@@ -238,7 +238,7 @@ plt.xlabel('Epochs')
 plt.ylabel('Accuracy')
 plt.legend()
 plt.show()
-
+################################################# below code for xgboost#######################
 def extract_features(generator, model, num_samples):
     features = []
     labels = []

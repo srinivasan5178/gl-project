@@ -1,4 +1,5 @@
-# TPR,FPR,AU-ROC - validation 050325
+# Validation code finaal - DenseNet201 & EfficientNetB7 - Srini
+# TPR,FPR,AU-ROC - Validation - validation 050325
 import Pyro4
 import ConfigSpace as CS
 import numpy as np
@@ -22,8 +23,8 @@ from sklearn.model_selection import train_test_split
 
 
 # Configure Pyro4 to use the remote nameserver (ngrok)
-Pyro4.config.NS_HOST = "6.tcp.ngrok.io"
-Pyro4.config.NS_PORT = 15899  # The ngrok port for the Pyro4 nameserver
+Pyro4.config.NS_HOST = "4.tcp.ngrok.io"
+Pyro4.config.NS_PORT = 19515  # The ngrok port for the Pyro4 nameserver
 
 print(f"Pyro4 NS_HOST: {Pyro4.config.NS_HOST}")
 print(f"Pyro4 NS_PORT: {Pyro4.config.NS_PORT}")
@@ -127,7 +128,7 @@ def build_cnn_model(input_shape=(64, 64, 3), learning_rate=0.0003176, num_classe
     # Define a dictionary to map the dataset type to the base model
     model_dict = {
         'lung': DenseNet201,
-        'colon': EfficientNetV2L
+        'colon': EfficientNetB7
     }
 
     # Choose the model based on the dataset type (avoiding elif)
@@ -196,11 +197,25 @@ def plot_confusion_matrix(cm, class_names, model_catboost, train_features, train
 # Objective function for BOHB optimization
 from sklearn.metrics import confusion_matrix
 
+from tabulate import tabulate
+
 class CNNCatBoostWorker(Worker):
     def compute(self, config, budget, *args, **kwargs):
         # Ensure correct dataset paths are used
-        colon_dataset_dir = '/content/Project_Sample/colon'
-        lung_dataset_dir = '/content/Project_Sample/lung'
+        colon_dataset_dir = '/content/Project_Sample_classified/train/colon'
+        lung_dataset_dir = '/content/Project_Sample_classified/train/lung'
+        colon_dataset_dir_val = '/content/Project_Sample_classified/val/colon'
+        lung_dataset_dir_val = '/content/Project_Sample_classified/val/lung'
+
+       
+        
+        colon_train_gen_val = create_data_generator_colon(colon_dataset_dir_val, batch_size=8)
+        lung_train_gen_val = create_data_generator_lung(lung_dataset_dir_val, batch_size=8)
+
+        # Create FusionDataGenerator for training and validation
+        val_gen = FusionDataGenerator(colon_train_gen_val, lung_train_gen_val, batch_size=8, steps_per_epoch=5, num_classes=5)  # Use same generators for val
+        
+
 
         # Extract hyperparameters
         learning_rate = config['learning_rate']
@@ -216,19 +231,22 @@ class CNNCatBoostWorker(Worker):
 
         # Create FusionDataGenerator for training and validation
         train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)
-        val_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)  # Use same generators for val
+        #val_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)  # Use same generators for val
 
         # Create and compile CNN model
         cnn_model = build_cnn_model(input_shape=(64, 64, 3), learning_rate=learning_rate, num_classes=5, dropout_rate=dropout_rate, weight_decay=weight_decay)
 
+        # Extract features from CNN for CatBoost #Now cnn_model has a value when it gets here
+        train_features, train_labels = extract_features_from_cnn(cnn_model, train_gen, steps=5)
+
         # Implement learning rate scheduling
         lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
 
-        # **Training**
-        start_train_time = time.time()  # Start training time
-        history = cnn_model.fit(train_gen, epochs=70, validation_data=val_gen, steps_per_epoch=5, validation_steps=5, callbacks=[lr_scheduler], verbose=0)  # Epoc set
-        end_train_time = time.time()  # End training time
-        train_time = end_train_time - start_train_time
+        # **validation**
+        start_val_time = time.time()  # Start training time
+        history = cnn_model.fit(train_gen, epochs=70, validation_data=val_gen, steps_per_epoch=5, validation_steps=5, callbacks=[lr_scheduler], verbose=0)  # Epoch set
+        end_val_time = time.time()  # End training time
+        val_time = end_val_time - start_val_time
 
         # Model evaluation on validation data
         val_loss, val_acc = cnn_model.evaluate(val_gen)
@@ -263,16 +281,7 @@ class CNNCatBoostWorker(Worker):
         fpr = cm.sum(axis=0) - np.diag(cm)  # FP for each class
         fpr = fpr / cm.sum(axis=0)  # FPR = FP / (FP + TN)
 
-        # Print results
-        print(f"Validation Accuracy: {accuracy}")
-        print(f"Validation Precision: {precision}")
-        print(f"Validation Recall (TPR): {tpr}")
-        print(f"Validation F1: {f1}")
-        print(f"Validation FPR: {fpr}")
-
-        # Optionally plot confusion matrix
-        plot_confusion_matrix(cm, class_names=['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc'], model_catboost=model_catboost, train_features=train_features_cnn, train_labels=train_labels_cnn, test_features=val_features_cnn, test_labels=val_labels_cnn)
-
+        # Calculate AUC-ROC
         from sklearn.preprocessing import label_binarize
         from sklearn.metrics import roc_auc_score
 
@@ -287,6 +296,28 @@ class CNNCatBoostWorker(Worker):
 
         # Output the AUC score
         print(f"Validation AUC: {auc_score}")
+
+        # Prepare the results for table format
+        results = [
+            ["Validation TPR", np.mean(tpr)],  # Use np.mean to get a single value
+            ["Validation FPR", np.mean(fpr)],  # Use np.mean to get a single value
+            ["Validation AUC", auc_score],
+            ["Validation Time", f"{val_time:.2f} seconds"],
+            ["Validation Loss", val_loss],
+            ["Validation F1 Score", f1],
+            ["Validation Accuracy", accuracy],
+            ["Validation Precision", precision],
+            ["Validation Recall", recall]
+        ]
+
+        # Print results in tabular format
+        print(tabulate(results, headers=["Metric", "Value"], tablefmt="grid"))
+
+        # Optionally plot confusion matrix
+        plot_confusion_matrix(cm, class_names=['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc'], model_catboost=model_catboost, train_features=train_features_cnn, train_labels=train_labels_cnn, test_features=val_features_cnn, test_labels=val_labels_cnn)
+
+        return {"validation_auc": auc_score}
+
 
 
 

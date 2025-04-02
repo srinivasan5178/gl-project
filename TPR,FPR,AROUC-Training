@@ -1,22 +1,4 @@
-# Name server connection check - Code
-import Pyro4
-
-# Set up Pyro4 configuration with ngrok details
-Pyro4.config.NS_HOST = "0.tcp.ngrok.io"
-Pyro4.config.NS_PORT = 13459  # The ngrok port for the Pyro4 nameserver
-
-# Check if the name server is reachable
-try:
-    # Try to get the nameserver object and ping it
-    nameserver = Pyro4.locateNS()
-    print("Pyro4 Name Server Connection Success!")
-    print(f"NS Host: {Pyro4.config.NS_HOST}")
-    print(f"NS Port: {Pyro4.config.NS_PORT}")
-except Pyro4.errors.NamingError as e:
-    print(f"Connection to Pyro4 Name Server failed: {e}")
-except Exception as e:
-    print(f"An unexpected error occurred: {e}")
-
+# Traning Final code - EfficientNetV2M & DenseNet201 - Srini - 020425
 # TPR,FPR,AROUC  - Code
 import Pyro4
 import ConfigSpace as CS
@@ -39,13 +21,40 @@ from tabulate import tabulate
 from tensorflow.keras.callbacks import ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
 
+import time
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, roc_curve, auc
+from keras.callbacks import ReduceLROnPlateau
+from tabulate import tabulate
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+# Traing - EfficientNetB7 - Final Code - 2 class -020425
+# Name server connection check - Code 
+import Pyro4
+
+# Set up Pyro4 configuration with ngrok details
+Pyro4.config.NS_HOST = "4.tcp.ngrok.io"
+Pyro4.config.NS_PORT = 19515  # The ngrok port for the Pyro4 nameserver
+
+# Check if the name server is reachable
+try:
+    # Try to get the nameserver object and ping it
+    nameserver = Pyro4.locateNS()
+    print("Pyro4 Name Server Connection Success!")
+    print(f"NS Host: {Pyro4.config.NS_HOST}")
+    print(f"NS Port: {Pyro4.config.NS_PORT}")
+except Pyro4.errors.NamingError as e:
+    print(f"Connection to Pyro4 Name Server failed: {e}")
+except Exception as e:
+    print(f"An unexpected error occurred: {e}")
 
 # Configure Pyro4 to use the remote nameserver (ngrok)
-Pyro4.config.NS_HOST = "0.tcp.ngrok.io"
-Pyro4.config.NS_PORT = 13459  # The ngrok port for the Pyro4 nameserver
+#Pyro4.config.NS_HOST = "4.tcp.ngrok.io"
+#Pyro4.config.NS_PORT = 13459  # The ngrok port for the Pyro4 nameserver
 
-print(f"Pyro4 NS_HOST: {Pyro4.config.NS_HOST}")
-print(f"Pyro4 NS_PORT: {Pyro4.config.NS_PORT}")
+#print(f"Pyro4 NS_HOST: {Pyro4.config.NS_HOST}")
+#print(f"Pyro4 NS_PORT: {Pyro4.config.NS_PORT}")
 
 
 # Custom Data Generator to handle both datasets (colon and lung)
@@ -146,7 +155,7 @@ def build_cnn_model(input_shape=(64, 64, 3), learning_rate=0.0003176, num_classe
     # Define a dictionary to map the dataset type to the base model
     model_dict = {
         'lung': DenseNet201,
-        'colon': EfficientNetB7
+        'colon': EfficientNetV2M
     }
 
     # Choose the model based on the dataset type (avoiding elif)
@@ -211,14 +220,143 @@ def plot_confusion_matrix(cm, class_names, model_catboost, train_features, train
     plt.show()
 
 
-# Objective function for BOHB optimization
-class CNNCatBoostWorker(Worker):
-    def compute(self, config, budget, *args, **kwargs):
-        # Ensure correct dataset paths are used
-        colon_dataset_dir = '/content/Project_Sample/colon'
-        lung_dataset_dir = '/content/Project_Sample/lung'
+# Function to calculate the performance metrics (TPR, FPR, Accuracy, etc.) during training
+def calculate_training_metrics(model, train_features, train_labels, batch_size=8):
+    # Get the model's predictions for the training dataset
+    train_predictions = model.predict(train_features)
+    train_pred_prob = train_predictions  # For multi-class, you can use model.predict_proba if applicable
 
-        # Extract hyperparameters
+    # Convert predictions to binary (if needed for multi-class problems)
+    train_pred_bin = np.argmax(train_pred_prob, axis=1)  # Ensure train_labels matches this format (class indices)
+
+    # Ensure train_labels is in the correct format (class indices, not one-hot encoded)
+    if len(train_labels.shape) > 1 and train_labels.shape[1] > 1:  # If one-hot encoded
+        train_labels = np.argmax(train_labels, axis=1)  # Convert to class indices
+
+    # Calculate confusion matrix
+    cm = confusion_matrix(train_labels, train_pred_bin)  # Get full confusion matrix
+    
+    # Calculate metrics for each class (or aggregate as needed)
+    tpr = np.diag(cm) / np.sum(cm, axis=1)  # Class-wise TPR (Recall)
+    fpr = (np.sum(cm, axis=0) - np.diag(cm)) / (np.sum(cm) - np.sum(cm, axis=0)) # Class-wise FPR
+    accuracy = np.sum(np.diag(cm)) / np.sum(cm)  # Overall accuracy
+    precision = precision_score(train_labels, train_pred_bin, average='weighted')
+    recall = recall_score(train_labels, train_pred_bin, average='weighted')
+    f1 = f1_score(train_labels, train_pred_bin, average='weighted')
+
+    # ROC Curve and AUC (adapt for multi-class if needed)
+    # For multi-class, you need to handle ROC AUC differently.
+    # Here's an example using 'macro' averaging:
+    from sklearn.preprocessing import label_binarize
+    train_labels_bin = label_binarize(train_labels, classes=np.unique(train_labels))
+    n_classes = train_labels_bin.shape[1]
+    
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(train_labels_bin[:, i], train_pred_prob[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+
+    # Compute micro-average ROC curve and ROC area
+    fpr["micro"], tpr["micro"], _ = roc_curve(train_labels_bin.ravel(), train_pred_prob.ravel())
+    roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+
+     # Compute macro-average ROC curve and ROC area (average across classes)
+    # First aggregate all false positive rates
+    all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+
+    # Then interpolate all ROC curves at this points
+    mean_tpr = np.zeros_like(all_fpr)
+    for i in range(n_classes):
+        mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+
+    # Finally average it and compute AUC
+    mean_tpr /= n_classes
+
+    fpr["macro"] = all_fpr
+    tpr["macro"] = mean_tpr
+    roc_auc["macro"] = auc(fpr["macro"], tpr["macro"])
+
+    # Use macro-averaged values for TPR, FPR, and ROC AUC
+    tpr_macro = tpr["macro"]
+    fpr_macro = fpr["macro"]
+    roc_auc_macro = roc_auc["macro"]
+
+    return tpr_macro, fpr_macro, accuracy, precision, recall, f1, roc_auc_macro # Return macro-averaged values
+
+
+# Function to extract features from the CNN model
+def extract_features_from_cnn(model, data_generator, steps):
+    features = []
+    labels = []
+    
+    # Collect features and labels for the training dataset
+    for step in range(steps):
+        data, label = data_generator.__getitem__(step)  # Get the batch data and labels
+        features.append(data)
+        labels.append(label)
+
+    features = np.concatenate(features, axis=0)
+    labels = np.concatenate(labels, axis=0)
+    
+    return features, labels
+
+
+# Define the CNN model (example)
+def build_cnn_model(input_shape=(64, 64, 3), learning_rate=0.001, num_classes=5, dropout_rate=0.5, weight_decay=0.0001):
+    from keras.models import Sequential
+    from keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+    from keras.optimizers import Adam
+
+    model = Sequential([
+        Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
+        MaxPooling2D(pool_size=(2, 2)),
+        Conv2D(64, (3, 3), activation='relu'),
+        MaxPooling2D(pool_size=(2, 2)),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dropout(dropout_rate),
+        Dense(num_classes, activation='softmax')
+    ])
+    
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='categorical_crossentropy', metrics=['accuracy'])
+    
+    return model
+
+
+# Function to load and split data into train, validation, and test sets
+def load_and_split_data():
+    # Assuming you're using numpy arrays for the dataset
+    # Replace with your actual image loading code and labels
+    data = np.random.rand(1000, 64, 64, 3)  # Example random data, replace with actual images
+    labels = np.random.randint(0, 5, size=(1000,))  # Example labels, replace with actual labels
+
+    # Split data into 70% train, 15% validation, 15% test
+    X_train, X_temp, y_train, y_temp = train_test_split(data, labels, test_size=0.3, random_state=42, stratify=labels)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
+
+    # One-hot encode the labels using tf.keras.utils.to_categorical
+    from tensorflow.keras.utils import to_categorical
+
+    y_train = to_categorical(y_train, num_classes=5)
+    y_val = to_categorical(y_val, num_classes=5)
+    y_test = to_categorical(y_test, num_classes=5)
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+
+# Worker for training the model and calculating metrics
+class CNNCatBoostWorker:
+    def __init__(self, run_id=None):  # Add __init__ method
+        self.run_id = run_id
+
+    def compute(self, config, budget, *args, **kwargs):
+        # Load and split the data
+        X_train, X_val, X_test, y_train, y_val, y_test = load_and_split_data()
+
+        # Define hyperparameters from config
         learning_rate = config['learning_rate']
         dropout_rate = config['dropout_rate']
         weight_decay = config['weight_decay']
@@ -226,208 +364,87 @@ class CNNCatBoostWorker(Worker):
         iterations = config['iterations']
         lr_catboost = config['lr_catboost']
 
-        # Create data generators
-        colon_train_gen = create_data_generator_colon(colon_dataset_dir, batch_size=8)
-        lung_train_gen = create_data_generator_lung(lung_dataset_dir, batch_size=8)
-
-        # Create FusionDataGenerator for training and validation
-        train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)
-        val_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)  # Use same generators for val
-
-        # Create and compile CNN model
+        # Build and compile the CNN model
         cnn_model = build_cnn_model(input_shape=(64, 64, 3), learning_rate=learning_rate, num_classes=5, dropout_rate=dropout_rate, weight_decay=weight_decay)
 
-        # Implement learning rate scheduling
+        # Learning rate scheduler
         lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
 
-        # **Training**
-        start_train_time = time.time()  # Start training time
-        history = cnn_model.fit(train_gen, epochs=70, validation_data=val_gen, steps_per_epoch=5, validation_steps=5, callbacks=[lr_scheduler], verbose=0)  # Epoc set
-        end_train_time = time.time()  # End training time
+        # Train the model with training and validation data
+        start_train_time = time.time()
+        history = cnn_model.fit(X_train, y_train, epochs=70, validation_data=(X_val, y_val), batch_size=32, callbacks=[lr_scheduler], verbose=0)
+        end_train_time = time.time()
+        
         train_time = end_train_time - start_train_time
 
-        # Extract features from CNN for CatBoost
-        train_features, train_labels = extract_features_from_cnn(cnn_model, train_gen, steps=5)
-        val_features, val_labels = extract_features_from_cnn(cnn_model, val_gen, steps=5)
+        # Calculate training features and labels to evaluate metrics
+        tpr, fpr, accuracy, precision, recall, f1, roc_auc = calculate_training_metrics(cnn_model, X_train, y_train)
 
-        # Split validation data for testing
-        val_features_split, test_features, val_labels_split, test_labels = train_test_split(val_features, val_labels, test_size=0.5, random_state=42)
+        # Get training loss (last loss value)
+        train_loss = history.history['loss'][-1]
 
-        # Train CatBoost model
-        model_catboost = CatBoostClassifier(
-            iterations=iterations,
-            learning_rate=lr_catboost,
-            depth=depth,
-            loss_function='MultiClass'
-        )
-        start_catboost_train_time = time.time()  # Start CatBoost training time
-        model_catboost.fit(train_features, train_labels, verbose=0)  # Fit CatBoost model
-        end_catboost_train_time = time.time()  # End CatBoost training time
-        catboost_train_time = end_catboost_train_time - start_catboost_train_time
+        # Evaluate the model on the test data
+        test_loss, test_accuracy = cnn_model.evaluate(X_test, y_test, verbose=0)
 
-        # Evaluate CatBoost performance
-        #val_predictions = model_catboost.predict(val_features_split)
-        #val_pred_prob = model_catboost.predict_proba(val_features_split)[:, 1]  # Get probabilities for ROC calculation
-
-        val_predictions = model_catboost.predict(val_features_split)  # Add this line to define val_predictions
-        val_pred_prob = model_catboost.predict_proba(val_features_split)[:, 1]  # Get probabilities for ROC calculation
-
-
-        # Calculate TPR, FPR, and AUC-ROC for validation data
-        #calculate_roc_auc(val_labels_split, val_pred_prob, ['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc'])
-
-        # Evaluate metrics on validation and test data
-        val_accuracy = accuracy_score(val_labels_split, val_predictions)
-        precision = precision_score(val_labels_split, val_predictions, average='weighted')
-        recall = recall_score(val_labels_split, val_predictions, average='weighted')
-        f1 = f1_score(val_labels_split, val_predictions, average='weighted')
-
-        # Calculate training metrics
-        train_predictions = model_catboost.predict(train_features)
-        train_accuracy = accuracy_score(train_labels, train_predictions)
-        train_precision = precision_score(train_labels, train_predictions, average='weighted')
-        train_recall = recall_score(train_labels, train_predictions, average='weighted')
-        train_f1 = f1_score(train_labels, train_predictions, average='weighted')
-        train_loss = history.history['loss'][-1] # Get the last training loss value
-
-        # Calculate test metrics
-        test_predictions = model_catboost.predict(test_features)
-        test_accuracy = accuracy_score(test_labels, test_predictions)
-        test_precision = precision_score(test_labels, test_predictions, average='weighted')
-        test_recall = recall_score(test_labels, test_predictions, average='weighted')
-        test_f1 = f1_score(test_labels, test_predictions, average='weighted')
-        test_loss = history.history['val_loss'][-1]  # Get the last validation loss value which is considered as test loss in this case
-        loss = history.history['val_loss'][-1] # Get the last validation loss value which is considered as test loss in this case
-        accuracy = accuracy_score(val_labels_split, val_predictions)
-
-
-
-        # Return result dictionary
-          # Return metrics
+        # Prepare the result dictionary with all metrics
         result = {
-            'train_accuracy': train_accuracy,
-            'val_accuracy': accuracy,
-            'test_accuracy': test_accuracy,
-            'train_precision': train_precision,
-            'val_precision': precision,
-            'test_precision': test_precision,
-            'train_recall': train_recall,
-            'val_recall': recall,
-            'test_recall': test_recall,
-            'train_f1': train_f1,
-            'val_f1': f1,
-            'test_f1': test_f1,
+            'train_accuracy': accuracy,
+            'train_precision': precision,
+            'train_recall': recall,
+            'train_f1': f1,
+            'train_roc_auc': roc_auc,
+            'train_tpr': tpr,
+            'train_fpr': fpr,
             'train_loss': train_loss,
-            'val_loss': loss,
-            'test_loss': test_loss,
             'train_time': train_time,
-            'catboost_train_time': catboost_train_time,
-            'val_time': catboost_train_time,
-            'test_time': 0.20  # Set this to a relevant value if required
+            'test_accuracy': test_accuracy,
+            'test_loss': test_loss
         }
 
-        print_metrics_table(result)  # Assuming you have a function that prints metrics
+        # Print the metrics table
+        print_metrics_table(result)
+
         return result
 
 
 
-
-# Function to print the metrics in a well-formatted table
+# Function to print the training metrics in a well-formatted table
 def print_metrics_table(result):
-    # Define the headers for the table
-    headers = ["Metric", "Training", "Validation", "Test"]
+    headers = ["Metric", "Training", "Test"]
 
-    # Define the rows of the table, formatted to 4 decimal places
+    # Check if train_tpr and train_fpr are dictionaries
+    # If so, convert to a single value (e.g., macro-average) for printing
+    train_tpr = result['train_tpr']
+    train_fpr = result['train_fpr']
+
+    # Modify to check if train_tpr is a dictionary or array
+    # and then convert to scalar or loop through it
+    if isinstance(train_tpr, dict):
+        train_tpr = np.mean(list(train_tpr.values()))  # Or another aggregation method
+    elif isinstance(train_tpr, np.ndarray):
+        train_tpr = train_tpr.mean()  # Take the mean if it's an array
+
+    # Modify to check if train_fpr is a dictionary or array
+    # and then convert to scalar or loop through it
+    if isinstance(train_fpr, dict):
+        train_fpr = np.mean(list(train_fpr.values()))  # Or another aggregation method
+    elif isinstance(train_fpr, np.ndarray):
+        train_fpr = train_fpr.mean()  # Take the mean if it's an array
+
+
     rows = [
-        ["Accuracy", f"{result['train_accuracy']:.4f}", f"{result['val_accuracy']:.4f}", f"{result['test_accuracy']:.4f}"],
-        ["Precision", f"{result['train_precision']:.4f}", f"{result['val_precision']:.4f}", f"{result['test_precision']:.4f}"],
-        ["Recall", f"{result['train_recall']:.4f}", f"{result['val_recall']:.4f}", f"{result['test_recall']:.4f}"],
-        ["F1 Score", f"{result['train_f1']:.4f}", f"{result['val_f1']:.4f}", f"{result['test_f1']:.4f}"],
-        ["Loss", f"{result['train_loss']:.4f}", f"{result['val_loss']:.4f}", f"{result['test_loss']:.4f}"],
-        ["Time (s)", f"{result['train_time']:.2f}", f"{result['val_time']:.2f}", f"{result['test_time']:.2f}"]
+        ["Accuracy", f"{result['train_accuracy']:.4f}", f"{result['test_accuracy']:.4f}"],
+        ["Precision", f"{result['train_precision']:.4f}", "-"],
+        ["Recall", f"{result['train_recall']:.4f}", "-"],
+        ["F1 Score", f"{result['train_f1']:.4f}", "-"],
+        ["ROC AUC", f"{result['train_roc_auc']:.4f}", "-"],
+        ["TPR (True Positive Rate)", f"{train_tpr:.4f}", "-"],  # Use the converted value
+        ["FPR (False Positive Rate)", f"{train_fpr:.4f}", "-"],  # Use the converted value
+        ["Loss", f"{result['train_loss']:.4f}", f"{result['test_loss']:.4f}"],
+        ["Time (s)", f"{result['train_time']:.2f}", "-"]
     ]
 
-    # Print the table using the tabulate library with a grid format
     print(tabulate(rows, headers=headers, tablefmt="grid"))
-
-
-# TPT& FPR & ROC
-from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve, auc, precision_recall_curve
-import matplotlib.pyplot as plt
-import numpy as np
-import seaborn as sns
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.datasets import make_classification
-from imblearn.over_sampling import SMOTE  # For handling class imbalance if needed
-
-# Function to adjust threshold for classification
-def adjust_threshold(y_true, y_pred_prob, threshold=0.5):
-    # Convert probabilities to binary predictions based on the threshold
-    y_pred_bin = (y_pred_prob[:, 1] >= threshold).astype(int)
-
-    # Calculate confusion matrix and classification metrics
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred_bin).ravel()
-    tpr = tp / (tp + fn)  # True Positive Rate (Recall)
-    fpr = fp / (fp + tn)  # False Positive Rate
-    accuracy = (tp + tn) / (tp + fp + fn + tn)
-
-    return tpr, fpr, accuracy, y_pred_bin
-
-# Function to plot precision-recall curve
-def plot_precision_recall_curve(y_true, y_pred_prob):
-    precision, recall, _ = precision_recall_curve(y_true, y_pred_prob[:, 1])  # Assuming class 1 is positive class
-    plt.plot(recall, precision, color='b', label=f'Precision-Recall curve (area = {auc(recall, precision):.2f})')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall curve')
-    plt.legend(loc='best')
-    plt.show()
-
-# Function to plot ROC curve and AUC
-def plot_roc_curve(y_true, y_pred_prob):
-    fpr, tpr, _ = roc_curve(y_true, y_pred_prob[:, 1])  # Assuming class 1 is positive class
-    auc_score = auc(fpr, tpr)
-    plt.figure()
-    plt.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (AUC = {auc_score:.2f})')
-    plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic')
-    plt.legend(loc='lower right')
-    plt.show()
-
-# Sample data generation (assuming binary classification problem)
-X, y = make_classification(n_samples=1000, n_features=20, n_classes=2, random_state=42)
-
-# Split the data into training and test sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-
-# Handle class imbalance using SMOTE (Optional)
-smote = SMOTE(sampling_strategy='auto', random_state=42)
-X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
-
-# Train a Logistic Regression model (you can replace this with any classifier)
-model = LogisticRegression(random_state=42)
-model.fit(X_train_res, y_train_res)
-
-# Get predicted probabilities for the test set
-y_pred_prob = model.predict_proba(X_test)
-
-# Adjust the threshold to balance between TPR and FPR
-threshold = 0.4  # Change this threshold value to adjust TPR/FPR balance
-tpr, fpr, accuracy, y_pred_bin = adjust_threshold(y_test, y_pred_prob, threshold)
-
-# Print adjusted performance metrics
-print(f"Adjusted TPR (Recall): {tpr:.4f}")
-print(f"Adjusted FPR: {fpr:.4f}")
-print(f"Accuracy: {accuracy:.4f}")
-
-# Plot the Precision-Recall and ROC curves for better evaluation
-plot_precision_recall_curve(y_test, y_pred_prob)
-plot_roc_curve(y_test, y_pred_prob)
-
-
 
 
 # Example usage:
@@ -439,7 +456,4 @@ if __name__ == "__main__":
     # Test the worker's computation method
     config = {'learning_rate': 0.001, 'dropout_rate': 0.3, 'weight_decay': 1e-5, 'depth': 10, 'iterations': 1000, 'lr_catboost': 0.1}
     result = worker.compute(config=config, budget=25)
-    print(result)
-
-
-
+    print(result

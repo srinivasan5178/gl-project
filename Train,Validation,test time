@@ -1,15 +1,16 @@
+# Final Code the Test - 020425 DenseNet201 & EfficientNetV2L 
 import Pyro4
 import ConfigSpace as CS
 import numpy as np
 from hpbandster.core.worker import Worker
 from catboost import CatBoostClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-from sklearn.metrics import ConfusionMatrixDisplay
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+from sklearn.metrics import ConfusionMatrixDisplay, roc_curve
 from tensorflow.keras import layers, models
 from tensorflow.keras.optimizers import Adam, SGD
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.utils import Sequence
-from tensorflow.keras.applications import DenseNet201, EfficientNetV2L, EfficientNetB7
+from tensorflow.keras.applications import DenseNet201, EfficientNetB7, EfficientNetV2L
 from tensorflow.keras.regularizers import l2
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -21,16 +22,17 @@ from sklearn.model_selection import train_test_split
 
 
 # Configure Pyro4 to use the remote nameserver (ngrok)
-Pyro4.config.NS_HOST = "0.tcp.ngrok.io"
-Pyro4.config.NS_PORT = 10515  # The ngrok port for the Pyro4 nameserver
+Pyro4.config.NS_HOST = "4.tcp.ngrok.io"
+Pyro4.config.NS_PORT = 19515  # The ngrok port for the Pyro4 nameserver
 
 print(f"Pyro4 NS_HOST: {Pyro4.config.NS_HOST}")
 print(f"Pyro4 NS_PORT: {Pyro4.config.NS_PORT}")
 
+
 # Custom Data Generator to handle both datasets (colon and lung)
 class FusionDataGenerator(Sequence):
     def __init__(self, colon_gen, lung_gen, batch_size, steps_per_epoch, num_classes=5, **kwargs):
-        super().__init__(**kwargs)  # Add this line
+        super().__init__(**kwargs)
         self.colon_gen = colon_gen
         self.lung_gen = lung_gen
         self.batch_size = batch_size
@@ -125,7 +127,7 @@ def build_cnn_model(input_shape=(64, 64, 3), learning_rate=0.0003176, num_classe
     # Define a dictionary to map the dataset type to the base model
     model_dict = {
         'lung': DenseNet201,
-        'colon': EfficientNetB7
+        'colon': EfficientNetV2L
     }
 
     # Choose the model based on the dataset type (avoiding elif)
@@ -180,6 +182,7 @@ def extract_features_from_cnn(model, generator, steps):
         labels.append(batch_y)
     return np.concatenate(features), np.concatenate(labels)
 
+
 # Function to plot the confusion matrix
 def plot_confusion_matrix(cm, class_names, model_catboost, train_features, train_labels, test_features, test_labels):
     plt.figure(figsize=(8, 6))
@@ -191,11 +194,28 @@ def plot_confusion_matrix(cm, class_names, model_catboost, train_features, train
 
 
 # Objective function for BOHB optimization
+from sklearn.metrics import confusion_matrix
+from tabulate import tabulate
+
 class CNNCatBoostWorker(Worker):
     def compute(self, config, budget, *args, **kwargs):
         # Ensure correct dataset paths are used
-        colon_dataset_dir = '/content/Project_Sample/colon'
-        lung_dataset_dir = '/content/Project_Sample/lung'
+        colon_dataset_dir = '/content/Project_Sample_classified/train/colon'
+        lung_dataset_dir = '/content/Project_Sample_classified/train/lung'
+        colon_dataset_dir_val = '/content/Project_Sample_classified/val/colon'
+        lung_dataset_dir_val = '/content/Project_Sample_classified/val/lung'
+        colon_dataset_dir_test = '/content/Project_Sample_classified/test/colon'  # Test dataset path
+        lung_dataset_dir_test = '/content/Project_Sample_classified/test/lung'      # Test dataset path
+        
+        # Create validation data generators
+        colon_train_gen_val = create_data_generator_colon(colon_dataset_dir_val, batch_size=8)
+        lung_train_gen_val = create_data_generator_lung(lung_dataset_dir_val, batch_size=8)
+        val_gen = FusionDataGenerator(colon_train_gen_val, lung_train_gen_val, batch_size=8, steps_per_epoch=5, num_classes=5)
+
+        # Create test data generators
+        colon_train_gen_test = create_data_generator_colon(colon_dataset_dir_test, batch_size=8)
+        lung_train_gen_test = create_data_generator_lung(lung_dataset_dir_test, batch_size=8)
+        test_gen = FusionDataGenerator(colon_train_gen_test, lung_train_gen_test, batch_size=8, steps_per_epoch=5, num_classes=5)
 
         # Extract hyperparameters
         learning_rate = config['learning_rate']
@@ -205,133 +225,135 @@ class CNNCatBoostWorker(Worker):
         iterations = config['iterations']
         lr_catboost = config['lr_catboost']
 
-        # Create data generators
+        # Create data generators for training
         colon_train_gen = create_data_generator_colon(colon_dataset_dir, batch_size=8)
         lung_train_gen = create_data_generator_lung(lung_dataset_dir, batch_size=8)
-
-        # Create FusionDataGenerator for training and validation
         train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)
-        val_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)  # Use same generators for val
 
-        # Create and compile CNN model
+        # Build and compile the CNN model
         cnn_model = build_cnn_model(input_shape=(64, 64, 3), learning_rate=learning_rate, num_classes=5, dropout_rate=dropout_rate, weight_decay=weight_decay)
+
+        # Extract features from CNN for training CatBoost
+        train_features, train_labels = extract_features_from_cnn(cnn_model, train_gen, steps=5)
 
         # Implement learning rate scheduling
         lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
 
-        # **Training**
-        start_train_time = time.time()  # Start training time
-        history = cnn_model.fit(train_gen, epochs=70, validation_data=val_gen, steps_per_epoch=5, validation_steps=5, callbacks=[lr_scheduler], verbose=0)  # Epoc set
-        end_train_time = time.time()  # End training time
-        train_time = end_train_time - start_train_time
+        # **Training the model**
+        start_val_time = time.time()
+        history = cnn_model.fit(train_gen, epochs=70, validation_data=val_gen, steps_per_epoch=5, validation_steps=5, callbacks=[lr_scheduler], verbose=0)
+        end_val_time = time.time()
+        val_time = end_val_time - start_val_time
 
-        # Extract features from CNN for CatBoost
-        train_features, train_labels = extract_features_from_cnn(cnn_model, train_gen, steps=5)
-        val_features, val_labels = extract_features_from_cnn(cnn_model, val_gen, steps=5)
+        # Model evaluation on validation data
+        val_loss, val_acc = cnn_model.evaluate(val_gen)
 
-       # Split validation data for testing
-        val_features_split, test_features, val_labels_split, test_labels = train_test_split(val_features, val_labels, test_size=0.5, random_state=42)
+        # Initialize CatBoost model
+        model_catboost = CatBoostClassifier(iterations=iterations, learning_rate=lr_catboost, depth=depth)
+
+        # Extract features from CNN model for CatBoost
+        cnn_model.trainable = False
+        train_features_cnn, train_labels_cnn = extract_features_from_cnn(cnn_model, train_gen, steps=5)
 
         # Train CatBoost model
-        model_catboost = CatBoostClassifier(
-            iterations=iterations,
-            learning_rate=lr_catboost,
-            depth=depth,
-            loss_function='MultiClass'
-        )
-        start_catboost_train_time = time.time()  # Start CatBoost training time
-        model_catboost.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=0)
-        end_catboost_train_time = time.time()  # End CatBoost training time
-        catboost_train_time = end_catboost_train_time - start_catboost_train_time
+        model_catboost.fit(train_features_cnn, train_labels_cnn)
 
-        # Save the CatBoost model
-        catboost_model_filename = "catboost_model.cbm"
-        model_catboost.save_model(catboost_model_filename)
-        print(f"CatBoost model saved to {catboost_model_filename}")
+        # **Validation Results**
+        val_features_cnn, val_labels_cnn = extract_features_from_cnn(cnn_model, val_gen, steps=5)
+        val_predictions = model_catboost.predict(val_features_cnn)
 
-        # Evaluate performance on validation set
-        val_predictions = model_catboost.predict(val_features)
-        accuracy = accuracy_score(val_labels, val_predictions)
-        precision = precision_score(val_labels, val_predictions, average='macro', zero_division=0)
-        recall = recall_score(val_labels, val_predictions, average='macro', zero_division=0)
-        f1 = f1_score(val_labels, val_predictions, average='macro', zero_division=0)
-        loss = model_catboost.score(val_features, val_labels)  # Using score as a proxy for loss
+        # Calculate confusion matrix for validation
+        cm_val = confusion_matrix(val_labels_cnn, val_predictions)
+        
+        # Calculate metrics for validation
+        val_accuracy = accuracy_score(val_labels_cnn, val_predictions)
+        val_precision = precision_score(val_labels_cnn, val_predictions, average='weighted')
+        val_recall = recall_score(val_labels_cnn, val_predictions, average='weighted')
+        val_f1 = f1_score(val_labels_cnn, val_predictions, average='weighted')
 
-         # Evaluate performance on training data
-        train_predictions = model_catboost.predict(train_features)
-        train_accuracy = accuracy_score(train_labels, train_predictions)
-        train_precision = precision_score(train_labels, train_predictions, average='macro', zero_division=0)
-        train_recall = recall_score(train_labels, train_predictions, average='macro', zero_division=0)
-        train_f1 = f1_score(train_labels, train_predictions, average='macro', zero_division=0)
-        train_loss = model_catboost.score(train_features, train_labels)
+        # **Test Results**
+        start_test_time = time.time()
+        test_features_cnn, test_labels_cnn = extract_features_from_cnn(cnn_model, test_gen, steps=5)
+        test_predictions = model_catboost.predict(test_features_cnn)
+        end_test_time = time.time()
+        test_time = end_test_time - start_test_time
 
-        #Evaluate performance on testing data
-        test_predictions = model_catboost.predict(test_features)
-        test_accuracy = accuracy_score(test_labels, test_predictions)
-        test_precision = precision_score(test_labels, test_predictions, average='macro', zero_division=0)
-        test_recall = recall_score(test_labels, test_predictions, average='macro', zero_division=0)
-        test_f1 = f1_score(test_labels, test_predictions, average='macro', zero_division=0)
-        test_loss = model_catboost.score(test_features, test_labels)
+        # Calculate confusion matrix for test
+        cm_test = confusion_matrix(test_labels_cnn, test_predictions)
 
+        # Calculate metrics for test
+        test_accuracy = accuracy_score(test_labels_cnn, test_predictions)
+        test_precision = precision_score(test_labels_cnn, test_predictions, average='weighted')
+        test_recall = recall_score(test_labels_cnn, test_predictions, average='weighted')
+        test_f1 = f1_score(test_labels_cnn, test_predictions, average='weighted')
+        test_loss = cnn_model.evaluate(test_gen)
 
+        # Calculate AUC for test data
+        from sklearn.preprocessing import label_binarize
 
-        print(f"Validation Accuracy: {accuracy:.4f}")
-        print(f"Validation Precision: {precision:.4f}")
-        print(f"Validation Recall: {recall:.4f}")
-        print(f"Validation F1 Score: {f1:.4f}")
-        print(f"Validation Loss: {loss:.4f}")
+        test_pred_prob = model_catboost.predict_proba(test_features_cnn)
+        test_labels_cnn_binarized = label_binarize(test_labels_cnn, classes=np.unique(test_labels_cnn))
+        test_auc_score = roc_auc_score(test_labels_cnn_binarized, test_pred_prob, average='weighted', multi_class='ovr')
 
-        # Confusion matrix
-        cm = confusion_matrix(val_labels, val_predictions)
-        class_names = ['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc']  # Adjust class names based on dataset
-        plot_confusion_matrix(cm, class_names, model_catboost, train_features, train_labels, test_features, test_labels)
+        # Print results in tabular format
+        results = [
+            ["Validation Accuracy", val_acc],
+            ["Validation F1 Score", val_f1],
+            ["Validation Precision", val_precision],
+            ["Validation Recall", val_recall],
+            ["Validation AUC", test_auc_score],
+            ["Validation Time", f"{val_time:.2f} seconds"],
+            ["Validation Loss", val_loss],
+            ["Test Accuracy", test_accuracy],
+            ["Test F1 Score", test_f1],
+            ["Test Precision", test_precision],
+            ["Test Recall", test_recall],
+            ["Test AUC", test_auc_score],
+            ["Test Time", f"{test_time:.2f} seconds"],
+            ["Test Loss", test_loss]
+        ]
 
-        # Return metrics
-        result = {
-            'train_accuracy': train_accuracy,
-            'val_accuracy': accuracy,
-            'test_accuracy': test_accuracy,
-            'train_precision': train_precision,
-            'val_precision': precision,
-            'test_precision': test_precision,
-            'train_recall': train_recall,
-            'val_recall': recall,
-            'test_recall': test_recall,
-            'train_f1': train_f1,
-            'val_f1': f1,
-            'test_f1': test_f1,
-            'train_loss': train_loss,
-            'val_loss': loss,
-            'test_loss': test_loss,
-            'train_time': train_time,
-            'catboost_train_time': catboost_train_time,
-            'val_time': catboost_train_time,
-            'test_time': 0.20  # Set this to a relevant value if required
+        print(tabulate(results, headers=["Metric", "Value"], tablefmt="grid"))
+
+        # Optionally plot confusion matrix for test data
+        plot_confusion_matrix(cm_test, class_names=['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc'], model_catboost=model_catboost, train_features=train_features_cnn, train_labels=train_labels_cnn, test_features=test_features_cnn, test_labels=test_labels_cnn)
+
+        return {
+            "validation_auc": test_auc_score,
+            "test_accuracy": test_accuracy,
+            "test_f1": test_f1,
+            "test_precision": test_precision,
+            "test_recall": test_recall,
+            "test_time": test_time
         }
 
-        # Print the results
-        print_metrics_table(result)
 
-        return result
+         # Print results in tabular format
+        print(tabulate(results, headers=["Metric", "Value"], tablefmt="grid"))
 
-# Function to print the metrics in a well-formatted table
-def print_metrics_table(result):
-    # Define the headers for the table
-    headers = ["Metric", "Training", "Validation", "Test"]
+        # Optionally plot confusion matrix
+        plot_confusion_matrix(cm, class_names=['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc'], model_catboost=model_catboost, train_features=test_features_cnn, train_labels=test_labels_cnn, test_features=test_features_cnn, test_labels=test_labels_cnn)
+        return {"test_auc": auc_score} # Corrected indentation
 
-    # Define the rows of the table, formatted to 4 decimal places
-    rows = [
-        ["Accuracy", f"{result['train_accuracy']:.4f}", f"{result['val_accuracy']:.4f}", f"{result['test_accuracy']:.4f}"],
-        ["Precision", f"{result['train_precision']:.4f}", f"{result['val_precision']:.4f}", f"{result['test_precision']:.4f}"],
-        ["Recall", f"{result['train_recall']:.4f}", f"{result['val_recall']:.4f}", f"{result['test_recall']:.4f}"],
-        ["F1", f"{result['train_f1']:.4f}", f"{result['val_f1']:.4f}", f"{result['test_f1']:.4f}"],
-        ["Loss", f"{result['train_loss']:.4f}", f"{result['val_loss']:.4f}", f"{result['test_loss']:.4f}"],
-        ["Training Time (s)", f"{result['train_time']:.4f}", "", ""],
-        ["CatBoost Train Time (s)", f"{result['catboost_train_time']:.4f}", "", ""]
-    ]
+    # Function to compute and print metrics in tabular format
+    def print_metrics_table(self, result):
+        # Define the headers for the table
+        headers = ["Metric", "Training", "Validation", "Test"]
 
-    # Print the table using the tabulate library
-    print(tabulate(rows, headers=headers, tablefmt="fancy_grid"))
+        # Define the rows of the table, formatted to 4 decimal places
+        rows = [
+            ["Accuracy", f"{result['train_accuracy']:.4f}", f"{result['val_accuracy']:.4f}", f"{result['test_accuracy']:.4f}"],
+            ["Precision", f"{result['train_precision']:.4f}", f"{result['val_precision']:.4f}", f"{result['test_precision']:.4f}"],
+            ["Recall", f"{result['train_recall']:.4f}", f"{result['val_recall']:.4f}", f"{result['test_recall']:.4f}"],
+            ["F1", f"{result['train_f1']:.4f}", f"{result['val_f1']:.4f}", f"{result['test_f1']:.4f}"],
+            ["Loss", f"{result['train_loss']:.4f}", f"{result['val_loss']:.4f}", f"{result['test_loss']:.4f}"],
+            ["Training Time (s)", f"{result['train_time']:.4f}", "", ""],
+            ["CatBoost Train Time (s)", f"{result['catboost_train_time']:.4f}", "", ""]
+        ]
+
+        # Print the table using the tabulate library
+        print(tabulate(rows, headers=headers, tablefmt="fancy_grid"))
+
 
 # Example usage:
 if __name__ == "__main__":

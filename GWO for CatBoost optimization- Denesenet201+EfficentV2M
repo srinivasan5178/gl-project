@@ -1,0 +1,233 @@
+import os
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import Dense, Dropout, Concatenate, BatchNormalization, GlobalAveragePooling2D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import mixed_precision
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import DenseNet201, EfficientNetV2L, EfficientNetV2M
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report, precision_score, recall_score, f1_score, accuracy_score
+from sklearn.utils.class_weight import compute_class_weight
+from catboost import CatBoostClassifier
+import splitfolders
+import time
+
+# Set mixed precision
+tf.keras.backend.clear_session()
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
+
+original_dataset_dir = "/content/Project_Sample"
+split_dataset_dir = "/content/Project_Sample_split"
+
+# Dataset split (if not already done)
+splitfolders.ratio(os.path.join(original_dataset_dir, 'colon'), output=os.path.join(split_dataset_dir, 'colon'), seed=42, ratio=(.7, .15, .15))
+splitfolders.ratio(os.path.join(original_dataset_dir, 'lung'), output=os.path.join(split_dataset_dir, 'lung'), seed=42, ratio=(.7, .15, .15))
+
+# Updated FusionDataGenerator
+class FusionDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, colon_gen, lung_gen, batch_size, steps_per_epoch, num_classes=5):
+        self.colon_gen = colon_gen
+        self.lung_gen = lung_gen
+        self.batch_size = batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.num_classes = num_classes
+        self._reset_iterators()
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+    def __getitem__(self, index):
+        try:
+            colon_images, colon_labels = next(self.colon_iterator)  # 0,1
+            lung_images, lung_labels = next(self.lung_iterator)     # 0,1,2 → will shift to 2,3,4
+            lung_labels += 2
+
+            images = np.concatenate([colon_images, lung_images], axis=0)
+            labels = np.concatenate([colon_labels, lung_labels], axis=0)
+
+            colon_images = tf.convert_to_tensor(images, dtype=tf.float32)
+            lung_images = tf.convert_to_tensor(images, dtype=tf.float32)
+            labels = tf.convert_to_tensor(labels, dtype=tf.int32)
+
+            return (colon_images, lung_images), labels
+        except StopIteration:
+            self._reset_iterators()
+            return self.__getitem__(index)
+
+    def _reset_iterators(self):
+        self.colon_iterator = iter(self.colon_gen)
+        self.lung_iterator = iter(self.lung_gen)
+
+# Data generators
+def create_data_generator(dataset_dir, class_list, batch_size):
+    datagen = ImageDataGenerator(rescale=1./255, rotation_range=40, width_shift_range=0.2,
+                                 height_shift_range=0.2, shear_range=0.2, zoom_range=0.2,
+                                 horizontal_flip=True, fill_mode='nearest')
+    return datagen.flow_from_directory(dataset_dir, target_size=(64, 64), batch_size=batch_size,
+                                       class_mode='sparse', classes=class_list, shuffle=True)
+
+# Base CNN feature extractor
+def create_base_model(base_model, input_shape=(64, 64, 3), output_dim=128):
+    for layer in base_model.layers[:400]:
+        layer.trainable = False
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dropout(0.5)(x)
+    x = Dense(output_dim, activation='relu')(x)
+    return Model(inputs=base_model.input, outputs=x)
+
+# Fusion model
+def build_model(dense1_units=512, dropout_rate=0.2, learning_rate=0.0003176, num_classes=5):
+    input_colon = Input(shape=(64, 64, 3))
+    input_lung = Input(shape=(64, 64, 3))
+    base1 = create_base_model(DenseNet201(weights='imagenet', include_top=False, input_shape=(64, 64, 3)))
+    base2 = create_base_model(EfficientNetV2M(weights='imagenet', include_top=False, input_shape=(64, 64, 3)))
+
+    features1 = base1(input_colon)
+    features2 = base2(input_lung)
+    merged = Concatenate()([features1, features2])
+    x = BatchNormalization()(merged)
+    x = Dense(dense1_units, activation='relu')(x)
+    x = Dropout(dropout_rate)(x)
+    x = BatchNormalization()(x)
+    x = Dense(256, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dense(128, activation='relu')(x)
+    output = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(inputs=[input_colon, input_lung], outputs=output)
+    model.compile(optimizer=Adam(learning_rate=learning_rate),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+# Extract features from fusion model
+def extract_features(model, generator, steps):
+    feature_model = Model(inputs=model.input, outputs=model.get_layer(index=-2).output)
+    features, labels = [], []
+    for _ in range(steps):
+        (x1, x2), y = generator[_]
+        feature = feature_model.predict([x1, x2], verbose=0)
+        features.append(feature)
+        labels.append(y)
+    return np.vstack(features), np.hstack(labels)
+
+# Evaluation
+def evaluate_metrics(y_true, y_pred, name):
+    print(f"\n{name} Metrics:")
+    print(f"Accuracy:  {accuracy_score(y_true, y_pred) * 100:.2f}%")
+    print(f"Precision: {precision_score(y_true, y_pred, average='weighted'):.4f}")
+    print(f"Recall:    {recall_score(y_true, y_pred, average='weighted'):.4f}")
+    print(f"F1 Score:  {f1_score(y_true, y_pred, average='weighted'):.4f}")
+
+def show_conf_matrix_and_report(y_true, y_pred, dataset_name):
+    class_names = ['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc']
+    print(f"\n--- {dataset_name} Classification Report ---")
+    print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    disp.plot(ax=ax, cmap=plt.cm.Blues, values_format='d')
+    plt.title(f"{dataset_name} Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+
+# GWO for CatBoost optimization
+def catboost_objective(params):
+    lr, depth, l2_leaf = params
+    model = CatBoostClassifier(learning_rate=lr, depth=int(depth), l2_leaf_reg=l2_leaf, verbose=0)
+    model.fit(X_train, y_train)
+    preds = model.predict(X_val)
+    return 1 - accuracy_score(y_val, preds)
+
+def gwo(objective, dim, bounds, num_agents=3, max_iter=3):
+    Alpha_pos, Beta_pos, Delta_pos = np.zeros(dim), np.zeros(dim), np.zeros(dim)
+    Alpha_score = Beta_score = Delta_score = float("inf")
+    Positions = np.random.rand(num_agents, dim)
+    for i in range(dim):
+        Positions[:, i] = Positions[:, i] * (bounds[i][1] - bounds[i][0]) + bounds[i][0]
+
+    for t in range(max_iter):
+        for i in range(num_agents):
+            fitness = objective(Positions[i])
+            if fitness < Alpha_score:
+                Alpha_score, Alpha_pos = fitness, Positions[i].copy()
+            elif fitness < Beta_score:
+                Beta_score, Beta_pos = fitness, Positions[i].copy()
+            elif fitness < Delta_score:
+                Delta_score, Delta_pos = fitness, Positions[i].copy()
+
+        a = 2 - t * (2 / max_iter)
+        for i in range(num_agents):
+            for j in range(dim):
+                r1, r2 = np.random.rand(), np.random.rand()
+                A1, C1 = 2 * a * r1 - a, 2 * r2
+                D_alpha = abs(C1 * Alpha_pos[j] - Positions[i, j])
+                X1 = Alpha_pos[j] - A1 * D_alpha
+
+                r1, r2 = np.random.rand(), np.random.rand()
+                A2, C2 = 2 * a * r1 - a, 2 * r2
+                D_beta = abs(C2 * Beta_pos[j] - Positions[i, j])
+                X2 = Beta_pos[j] - A2 * D_beta
+
+                r1, r2 = np.random.rand(), np.random.rand()
+                A3, C3 = 2 * a * r1 - a, 2 * r2
+                D_delta = abs(C3 * Delta_pos[j] - Positions[i, j])
+                X3 = Delta_pos[j] - A3 * D_delta
+
+                Positions[i, j] = np.clip((X1 + X2 + X3) / 3.0, bounds[j][0], bounds[j][1])
+
+    return Alpha_pos, Alpha_score
+
+# === RUN THE TRAINING PIPELINE ===
+
+batch_size = 8
+steps_per_epoch = 50
+val_steps = 20
+
+colon_train_gen = create_data_generator(os.path.join(split_dataset_dir, "colon/train"), ['colon_aca', 'colon_n'], batch_size)
+lung_train_gen = create_data_generator(os.path.join(split_dataset_dir, "lung/train"), ['lung_aca', 'lung_n', 'lung_scc'], batch_size)
+colon_val_gen = create_data_generator(os.path.join(split_dataset_dir, "colon/val"), ['colon_aca', 'colon_n'], batch_size)
+lung_val_gen = create_data_generator(os.path.join(split_dataset_dir, "lung/val"), ['lung_aca', 'lung_n', 'lung_scc'], batch_size)
+
+train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size, steps_per_epoch)
+val_gen = FusionDataGenerator(colon_val_gen, lung_val_gen, batch_size, val_steps)
+
+model = build_model()
+callbacks = [EarlyStopping(patience=5, restore_best_weights=True), ReduceLROnPlateau(factor=0.2, patience=3, min_lr=1e-6)]
+
+model.fit(train_gen, validation_data=val_gen, epochs=10, callbacks=callbacks)
+
+X_train, y_train = extract_features(model, train_gen, len(train_gen))
+X_val, y_val = extract_features(model, val_gen, len(val_gen))
+
+# GWO optimization
+bounds = [(0.01, 0.2), (4, 10), (1, 10)]
+best_params, _ = gwo(catboost_objective, dim=3, bounds=bounds)
+
+# Compute class weights
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+class_weights_dict = {i: w for i, w in enumerate(class_weights)}
+
+# Train CatBoost
+cat_model = CatBoostClassifier(learning_rate=best_params[0], depth=int(best_params[1]), l2_leaf_reg=best_params[2], class_weights=class_weights_dict, verbose=0)
+start_train = time.time()
+cat_model.fit(X_train, y_train)
+train_duration = time.time() - start_train
+
+start_val = time.time()
+y_train_pred = cat_model.predict(X_train)
+y_val_pred = cat_model.predict(X_val)
+val_duration = time.time() - start_val
+
+# Evaluation
+evaluate_metrics(y_train, y_train_pred, "Training")
+evaluate_metrics(y_val, y_val_pred, "Validation")
+print(f"\nTraining time: {train_duration:.2f}s")
+print(f"Validation time: {val_duration:.2f}s")
+
+show_conf_matrix_and_report(y_val, y_val_pred, "Validation")

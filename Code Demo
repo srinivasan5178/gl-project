@@ -414,3 +414,69 @@ ConfusionMatrixDisplay(confusion_matrix=cm_val,
                        display_labels=target_names).plot()  # Use all class names
 plt.title("Validation Confusion Matrix for XGBoost Model")
 plt.show()
+
+## Validation 
+
+# validation 
+
+import pandas as pd
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
+import numpy as np
+import os
+
+# Load your trained model
+model = load_model('best_model.keras')
+
+# Class names (adjust according to your model)
+class_names = ['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc']
+
+# Read and preprocess a new image
+def preprocess_image(img_path):
+    img = image.load_img(img_path, target_size=(64, 64))  
+    img_array = image.img_to_array(img)
+    img_array = img_array / 255.0  # Normalize
+    img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension
+    return img_array
+
+# Paths to the colon and lung validation folders
+colon_folder = '/content/colon_validation'
+lung_folder = '/content/lung_validation'
+
+# Get list of all images
+colon_images = sorted(os.listdir(colon_folder))
+lung_images = sorted(os.listdir(lung_folder))
+
+# To store predictions
+results = []
+
+# Loop through available pairs - stop at the shorter list's length
+num_pairs = min(len(colon_images), len(lung_images))  # Get the minimum length
+for i in range(num_pairs):  # Iterate using index
+    colon_img_name = colon_images[i]  # Access using index
+    lung_img_name = lung_images[i]    # Access using index
+
+    colon_path = os.path.join(colon_folder, colon_img_name)
+    lung_path = os.path.join(lung_folder, lung_img_name)
+    
+    # Preprocess both images
+    colon_img = preprocess_image(colon_path)
+    lung_img = preprocess_image(lung_path)
+
+    # Predict
+    prediction = model.predict([colon_img, lung_img])
+    predicted_class_idx = np.argmax(prediction, axis=1)[0]
+    predicted_class = class_names[predicted_class_idx]
+    
+    # Save the results
+    results.append({
+        "colon_image": colon_img_name,
+        "lung_image": lung_img_name,
+        "predicted_class": predicted_class
+    })
+
+# Save results to a CSV file
+df = pd.DataFrame(results)
+df.to_csv('validation_predictions.csv', index=False)
+
+print("Predictions saved to 'validation_predictions.csv'.")

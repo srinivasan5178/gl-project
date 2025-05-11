@@ -127,7 +127,7 @@ def create_data_generator_lung(dataset_dir, batch_size):
 # Base model creation functions with fine-tuning
 def create_base_model1(input_shape=(64, 64, 3), output_dim=128):
     base_model_colon = tf.keras.applications.DenseNet201(weights='imagenet', include_top=False, input_shape=input_shape)
-    for layer in base_model_colon.layers[:400]:
+    for layer in base_model_colon.layers[:400]:  # unfreezing first 400 layers 
         layer.trainable = False
 
     x = base_model_colon.output

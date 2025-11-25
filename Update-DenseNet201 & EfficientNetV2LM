@@ -1,0 +1,473 @@
+# full_end_to_end_balanced_split_gwo_catboost.py - code fixed the impalance lung_n - DenseNet201 & EfficientNetV2LM
+import os
+import shutil
+import random
+import time
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import Dense, Dropout, Concatenate, BatchNormalization, GlobalAveragePooling2D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import mixed_precision
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import DenseNet201, EfficientNetV2L,EfficientNetV2M
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report, precision_score, recall_score, f1_score, accuracy_score
+from sklearn.utils.class_weight import compute_class_weight
+from catboost import CatBoostClassifier
+import numpy as np
+
+# ===========================
+# USER CONFIGURATION
+# ===========================
+original_dataset_dir = "/content/Project_Sample"          # input dataset root (contains 'colon' and 'lung' subfolders)
+split_dataset_dir = "/content/Project_Sample_split_bal"   # output balanced + split dataset root
+plots_dir = "./plots"
+os.makedirs(plots_dir, exist_ok=True)
+
+# desired split ratios
+RATIO = (0.7, 0.15, 0.15)  # train, val, test
+
+# random seed for reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+# batch & training params
+batch_size = 8
+epochs = 10
+
+# GWO params (kept modest for runtime)
+GWO_AGENTS = 5
+GWO_ITERS = 5
+
+# ===========================
+# UTIL: create directory safe
+# ===========================
+def makedirs_safe(path):
+    os.makedirs(path, exist_ok=True)
+
+# ===========================
+# BALANCED SPLIT FUNCTION
+# ===========================
+def balanced_split_and_oversample(input_root, output_root, ratio=(0.7,0.15,0.15), seed=42):
+    """
+    For each class folder under input_root (recursively), this function:
+      - enumerates image files
+      - computes the maximum class size across all classes
+      - oversamples minority classes (with replacement) up to that maximum
+      - shuffles and splits each class into train/val/test according to ratio
+      - copies files into output_root/{train,val,test}/{class_name}/image.jpg
+    This ensures every class has identical counts in each split.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    makedirs_safe(output_root)
+    sets = ['train', 'val', 'test']
+
+    # collect class-to-files map for all classes under input_root (two folders: colon, lung)
+    class_files = {}
+    for domain in sorted(os.listdir(input_root)):
+        domain_path = os.path.join(input_root, domain)
+        if not os.path.isdir(domain_path):
+            continue
+        for cls in sorted(os.listdir(domain_path)):
+            cls_path = os.path.join(domain_path, cls)
+            if not os.path.isdir(cls_path):
+                continue
+            key = cls  # we use class name only (e.g., colon_aca, lung_n ...)
+            files = [os.path.join(cls_path, f) for f in sorted(os.listdir(cls_path)) if os.path.isfile(os.path.join(cls_path, f))]
+            class_files[key] = files
+
+    if len(class_files) == 0:
+        raise ValueError("No class folders found under input_root. Expect structure input_root/colon/<class>/ and input_root/lung/<class>/")
+
+    # find maximum class size to oversample to
+    counts = {k: len(v) for k, v in class_files.items()}
+    max_count = max(counts.values())
+    print("Per-class original counts:", counts)
+    print("Oversampling minority classes up to:", max_count)
+
+    # prepare output dirs
+    for s in sets:
+        for cls in class_files.keys():
+            out_dir = os.path.join(output_root, cls.split('_')[0], s, cls)  # keep domain folder (colon/lung) as top-level domain
+            makedirs_safe(out_dir)
+
+    # For each class, oversample to max_count, then split
+    for cls, files in class_files.items():
+        if len(files) == 0:
+            print(f"Warning: class {cls} has 0 files — skipping.")
+            continue
+
+        # Oversample with replacement to reach max_count
+        if len(files) < max_count:
+            extra = list(np.random.choice(files, size=(max_count - len(files)), replace=True))
+            files_expanded = files + extra
+        else:
+            files_expanded = list(files)
+
+        random.shuffle(files_expanded)
+
+        n = len(files_expanded)
+        n_train = int(np.floor(n * ratio[0]))
+        n_val = int(np.floor(n * ratio[1]))
+        n_test = n - n_train - n_val
+
+        train_files = files_expanded[:n_train]
+        val_files = files_expanded[n_train:n_train + n_val]
+        test_files = files_expanded[n_train + n_val:]
+
+        # Copy files into output_root/domain/split/class
+        # domain = prefix before '_' in class name (e.g., 'colon' from 'colon_aca')
+        domain = cls.split('_')[0]
+        for src in train_files:
+            dst_dir = os.path.join(output_root, domain, 'train', cls)
+            makedirs_safe(dst_dir)
+            shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+
+        for src in val_files:
+            dst_dir = os.path.join(output_root, domain, 'val', cls)
+            makedirs_safe(dst_dir)
+            shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+
+        for src in test_files:
+            dst_dir = os.path.join(output_root, domain, 'test', cls)
+            makedirs_safe(dst_dir)
+            shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+
+    # print final counts
+    final_counts = {}
+    for domain in sorted(os.listdir(output_root)):
+        domain_path = os.path.join(output_root, domain)
+        for split in ['train', 'val', 'test']:
+            for cls in sorted(os.listdir(os.path.join(domain_path, split))):
+                cls_path = os.path.join(domain_path, split, cls)
+                final_counts[(domain, split, cls)] = len([f for f in os.listdir(cls_path) if os.path.isfile(os.path.join(cls_path, f))])
+    print("Final counts per (domain, split, class):")
+    for k, v in final_counts.items():
+        print(k, v)
+
+# ===========================
+# FusionDataGenerator (fixed)
+# ===========================
+class FusionDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, colon_gen, lung_gen, batch_size, num_classes=5):
+        self.colon_gen = colon_gen
+        self.lung_gen = lung_gen
+        self.batch_size = batch_size
+        self.num_classes = num_classes
+        # Use underlying generator lengths – ensure we will exhaust both (by using min len)
+        self.steps = min(len(self.colon_gen), len(self.lung_gen))
+        self._reset_iterators()
+
+    def __len__(self):
+        return self.steps
+
+    def __getitem__(self, idx):
+        try:
+            colon_images, colon_labels = next(self.colon_iterator)
+        except StopIteration:
+            self.colon_iterator = iter(self.colon_gen)
+            colon_images, colon_labels = next(self.colon_iterator)
+
+        try:
+            lung_images, lung_labels = next(self.lung_iterator)
+        except StopIteration:
+            self.lung_iterator = iter(self.lung_gen)
+            lung_images, lung_labels = next(self.lung_iterator)
+
+        # shift lung labels
+        lung_labels = lung_labels + 2
+
+        images = np.concatenate([colon_images, lung_images], axis=0)
+        labels = np.concatenate([colon_labels, lung_labels], axis=0)
+
+        # preserve original logic: pass same images to both inputs
+        return (images, images), labels
+
+    def _reset_iterators(self):
+        self.colon_iterator = iter(self.colon_gen)
+        self.lung_iterator = iter(self.lung_gen)
+
+# ===========================
+# Data generator factory
+# ===========================
+def create_data_generator(dataset_dir, class_list, batch_size, shuffle=True):
+    datagen = ImageDataGenerator(rescale=1./255,
+                                 rotation_range=40,
+                                 width_shift_range=0.2,
+                                 height_shift_range=0.2,
+                                 shear_range=0.2,
+                                 zoom_range=0.2,
+                                 horizontal_flip=True,
+                                 fill_mode='nearest')
+    return datagen.flow_from_directory(dataset_dir,
+                                       target_size=(64,64),
+                                       batch_size=batch_size,
+                                       class_mode='sparse',
+                                       classes=class_list,
+                                       shuffle=shuffle)
+
+# ===========================
+# Base model builder
+# ===========================
+def create_base_model(base_model, input_shape=(64,64,3), output_dim=128):
+    for layer in base_model.layers[:400]:
+        layer.trainable = False
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dropout(0.5)(x)
+    x = Dense(output_dim, activation='relu')(x)
+    return Model(inputs=base_model.input, outputs=x)
+
+# ===========================
+# Fusion model (unchanged)
+# ===========================
+def build_model(dense1_units=512, dropout_rate=0.2, learning_rate=0.0003176, num_classes=5):
+    input_colon = Input(shape=(64,64,3))
+    input_lung = Input(shape=(64,64,3))
+    base1 = create_base_model(DenseNet201(weights='imagenet', include_top=False, input_shape=(64,64,3)))
+    base2 = create_base_model(EfficientNetV2M(weights='imagenet', include_top=False, input_shape=(64,64,3)))
+
+    features1 = base1(input_colon)
+    features2 = base2(input_lung)
+    merged = Concatenate()([features1, features2])
+    x = BatchNormalization()(merged)
+    x = Dense(dense1_units, activation='relu')(x)
+    x = Dropout(dropout_rate)(x)
+    x = BatchNormalization()(x)
+    x = Dense(256, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dense(128, activation='relu')(x)
+    output = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(inputs=[input_colon, input_lung], outputs=output)
+    model.compile(optimizer=Adam(learning_rate=learning_rate),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+# ===========================
+# Feature extraction
+# ===========================
+def extract_features(model, generator):
+    feature_model = Model(inputs=model.input, outputs=model.layers[-2].output)
+    feats = []
+    labs = []
+    for i in range(len(generator)):
+        (x1, x2), y = generator[i]
+        f = feature_model.predict([x1, x2], verbose=0)
+        feats.append(f)
+        labs.append(y)
+    return np.vstack(feats), np.hstack(labs)
+
+# ===========================
+# Evaluation helpers
+# ===========================
+def evaluate_metrics(y_true, y_pred, name):
+    print(f"\n{name} Metrics:")
+    print(f"Accuracy:  {accuracy_score(y_true, y_pred) * 100:.2f}%")
+    print(f"Precision: {precision_score(y_true, y_pred, average='weighted'):.4f}")
+    print(f"Recall:    {recall_score(y_true, y_pred, average='weighted'):.4f}")
+    print(f"F1 Score:  {f1_score(y_true, y_pred, average='weighted'):.4f}")
+
+def show_conf_matrix_and_report(y_true, y_pred, dataset_name):
+    class_names = ['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc']
+    print(f"\n--- {dataset_name} Classification Report ---")
+    print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    fig, ax = plt.subplots(figsize=(8,6))
+    disp.plot(ax=ax, cmap=plt.cm.Blues, values_format='d')
+    plt.title(f"{dataset_name} Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+
+# ===========================
+# GWO implementation
+# ===========================
+def gwo(objective, dim, bounds, num_agents=5, max_iter=5):
+    Alpha_pos = np.zeros(dim)
+    Beta_pos = np.zeros(dim)
+    Delta_pos = np.zeros(dim)
+    Alpha_score = Beta_score = Delta_score = float("inf")
+
+    Positions = np.random.rand(num_agents, dim)
+    for i in range(dim):
+        Positions[:, i] = Positions[:, i] * (bounds[i][1] - bounds[i][0]) + bounds[i][0]
+
+    for t in range(max_iter):
+        for i in range(num_agents):
+            fitness = objective(Positions[i])
+            if fitness < Alpha_score:
+                Alpha_score, Alpha_pos = fitness, Positions[i].copy()
+            elif fitness < Beta_score:
+                Beta_score, Beta_pos = fitness, Positions[i].copy()
+            elif fitness < Delta_score:
+                Delta_score, Delta_pos = fitness, Positions[i].copy()
+
+        a = 2 - t * (2 / max_iter)
+        for i in range(num_agents):
+            for j in range(dim):
+                r1, r2 = np.random.rand(), np.random.rand()
+                A1, C1 = 2 * a * r1 - a, 2 * r2
+                D_alpha = abs(C1 * Alpha_pos[j] - Positions[i, j])
+                X1 = Alpha_pos[j] - A1 * D_alpha
+
+                r1, r2 = np.random.rand(), np.random.rand()
+                A2, C2 = 2 * a * r1 - a, 2 * r2
+                D_beta = abs(C2 * Beta_pos[j] - Positions[i, j])
+                X2 = Beta_pos[j] - A2 * D_beta
+
+                r1, r2 = np.random.rand(), np.random.rand()
+                A3, C3 = 2 * a * r1 - a, 2 * r2
+                D_delta = abs(C3 * Delta_pos[j] - Positions[i, j])
+                X3 = Delta_pos[j] - A3 * D_delta
+
+                Positions[i, j] = np.clip((X1 + X2 + X3) / 3.0, bounds[j][0], bounds[j][1])
+
+    return Alpha_pos, Alpha_score
+
+# ===========================
+# MAIN RUN
+# ===========================
+if __name__ == "__main__":
+    # 1) Balanced split & oversample (creates split_dataset_dir)
+    print("Creating balanced and split dataset (this will copy files)...")
+    balanced_split_and_oversample(original_dataset_dir, split_dataset_dir, ratio=RATIO, seed=SEED)
+
+    # 2) Create data generators (train/val/test)
+    class_list_colon = ['colon_aca', 'colon_n']
+    class_list_lung = ['lung_aca', 'lung_n', 'lung_scc']
+
+    colon_train_gen = create_data_generator(os.path.join(split_dataset_dir, 'colon', 'train'), class_list_colon, batch_size, shuffle=True)
+    lung_train_gen = create_data_generator(os.path.join(split_dataset_dir, 'lung', 'train'), class_list_lung, batch_size, shuffle=True)
+    colon_val_gen = create_data_generator(os.path.join(split_dataset_dir, 'colon', 'val'), class_list_colon, batch_size, shuffle=False)
+    lung_val_gen = create_data_generator(os.path.join(split_dataset_dir, 'lung', 'val'), class_list_lung, batch_size, shuffle=False)
+
+    # 3) Fusion generators (fixed to use all images)
+    train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size)
+    val_gen = FusionDataGenerator(colon_val_gen, lung_val_gen, batch_size)
+
+    # Print sample counts to confirm
+    total_train_samples = colon_train_gen.samples + lung_train_gen.samples
+    total_val_samples = colon_val_gen.samples + lung_val_gen.samples
+    print(f"Total train samples (sum of colon+lung): {total_train_samples}")
+    print(f"Total val   samples (sum of colon+lung): {total_val_samples}")
+    print(f"Train steps: {len(train_gen)}, Val steps: {len(val_gen)}, batch_size: {batch_size}")
+
+    # 4) Build and train fusion model
+    print("Building fusion model...")
+    model = build_model(num_classes=5)
+
+    es = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1)
+    rlp = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=1e-6, verbose=1)
+    mcp = ModelCheckpoint('best_fusion_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
+    callbacks = [es, rlp, mcp]
+
+    history = model.fit(
+        train_gen,
+        validation_data=val_gen,
+        epochs=epochs,
+        callbacks=callbacks,
+        steps_per_epoch=len(train_gen),
+        validation_steps=len(val_gen),
+        verbose=1
+    )
+
+    # 5) Best epoch and plot history
+    if 'val_loss' in history.history and len(history.history['val_loss']) > 0:
+        best_idx = int(np.argmin(history.history['val_loss']))
+        best_epoch = best_idx + 1
+        best_val_loss = float(history.history['val_loss'][best_idx])
+        best_val_acc = float(history.history['val_accuracy'][best_idx]) if 'val_accuracy' in history.history else None
+        print(f"\nBest epoch (by val_loss): {best_epoch} (val_loss={best_val_loss:.6f}, val_acc={best_val_acc})")
+
+    # accuracy plot
+    train_acc_key = 'accuracy' if 'accuracy' in history.history else 'acc'
+    val_acc_key = 'val_accuracy' if 'val_accuracy' in history.history else 'val_acc'
+    plt.figure(figsize=(8,5))
+    plt.plot(history.history.get(train_acc_key, []), label='Train Accuracy')
+    plt.plot(history.history.get(val_acc_key, []), label='Val Accuracy')
+    plt.title("Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.grid(True)
+    acc_path = os.path.join(plots_dir, "accuracy.png")
+    plt.savefig(acc_path, bbox_inches='tight')
+    plt.show()
+    print("Saved accuracy plot to:", acc_path)
+
+    # loss plot
+    plt.figure(figsize=(8,5))
+    plt.plot(history.history.get('loss', []), label='Train Loss')
+    plt.plot(history.history.get('val_loss', []), label='Val Loss')
+    plt.title("Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    loss_path = os.path.join(plots_dir, "loss.png")
+    plt.savefig(loss_path, bbox_inches='tight')
+    plt.show()
+    print("Saved loss plot to:", loss_path)
+
+    # 6) Extract features for CatBoost (all samples)
+    print("Extracting features for CatBoost...")
+    X_train, y_train = extract_features(model, train_gen)
+    X_val, y_val = extract_features(model, val_gen)
+    print("Feature shapes:", X_train.shape, y_train.shape, X_val.shape, y_val.shape)
+
+    # 7) Define CatBoost objective for GWO
+    def catboost_objective(params):
+        lr = float(params[0])
+        depth = int(round(params[1]))
+        l2_leaf = float(params[2])
+        mdl = CatBoostClassifier(learning_rate=lr, depth=depth, l2_leaf_reg=l2_leaf, verbose=0)
+        mdl.fit(X_train, y_train)
+        preds = mdl.predict(X_val)
+        return 1.0 - accuracy_score(y_val, preds)
+
+    # 8) Run GWO
+    print("Running GWO for CatBoost hyperparams (may take a while)...")
+    bounds = [(0.01, 0.2), (4, 10), (1, 10)]
+    best_pos, best_score = gwo(catboost_objective, dim=3, bounds=bounds, num_agents=GWO_AGENTS, max_iter=GWO_ITERS)
+    best_lr = float(best_pos[0])
+    best_depth = int(round(best_pos[1]))
+    best_l2 = float(best_pos[2])
+    print(f"GWO best found (approx): lr={best_lr:.4f}, depth={best_depth}, l2_leaf={best_l2:.4f} (score={best_score:.4f})")
+
+    # 9) Train CatBoost with class weights
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    class_weights_dict = {i: float(w) for i, w in enumerate(class_weights)}
+    print("Class weights:", class_weights_dict)
+
+    cat_model = CatBoostClassifier(learning_rate=best_lr, depth=best_depth, l2_leaf_reg=best_l2,
+                                   class_weights=class_weights_dict, verbose=0)
+
+    start_train = time.time()
+    cat_model.fit(X_train, y_train)
+    train_time = time.time() - start_train
+    print(f"CatBoost training time: {train_time:.2f}s")
+
+    # Predictions
+    start_pred = time.time()
+    y_train_pred = cat_model.predict(X_train)
+    y_val_pred = cat_model.predict(X_val)
+    pred_time = time.time() - start_pred
+    print(f"Prediction time (val): {pred_time:.2f}s")
+
+    # 10) Metrics and reports
+    evaluate_metrics(y_train, y_train_pred, "Training")
+    evaluate_metrics(y_val, y_val_pred, "Validation")
+    show_conf_matrix_and_report(y_val, y_val_pred, "Validation")
+
+    # Save CatBoost model
+    cat_model.save_model("catboost_fusion_model.cbm")
+    print("Saved CatBoost model to catboost_fusion_model.cbm")
+
+    print("\nAll done.")

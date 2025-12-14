@@ -1,0 +1,494 @@
+# BOHB+ DenseNet201, EfficientNetV2M with Confusion Matrices and Pyro4 NameServer (change EfficientNetV2L also)
+
+import os
+import shutil
+import random
+import time
+import json
+import datetime
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+import tensorflow as tf
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import Dense, Dropout, Concatenate, BatchNormalization, GlobalAveragePooling2D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import DenseNet201, EfficientNetV2M
+
+from sklearn.metrics import (confusion_matrix, ConfusionMatrixDisplay,
+                             classification_report, precision_score, recall_score,
+                             f1_score, accuracy_score)
+from sklearn.utils.class_weight import compute_class_weight
+
+from catboost import CatBoostClassifier
+
+# HPBandSter / ConfigSpace
+import ConfigSpace as CS
+from hpbandster.core.worker import Worker
+
+# Pyro4 for remote name server (optional)
+import Pyro4
+
+# -------------------------
+# USER CONFIG
+# -------------------------
+original_dataset_dir = "/content/Project_Sample"        # original dataset (domains: colon/, lung/) OR flat classes
+balanced_temp_dir   = "/content/Project_Sample_balanced" # temp oversampled dataset root
+split_dataset_dir   = "/content/Project_Sample_split_bal" # final train/val/test (balanced)
+outputs_root = "./runs"
+plots_dir = os.path.join(outputs_root, "plots")
+os.makedirs(plots_dir, exist_ok=True)
+
+RATIO = (0.7, 0.15, 0.15)  # train, val, test per-class ratio
+SEED = 42
+batch_size = 8
+epochs = 5000   # change to larger value when ready
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+# -------------------------
+# UTILITIES
+# -------------------------
+def clean_folder(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+
+def list_subdirs(path):
+    if not os.path.exists(path):
+        return []
+    return sorted([d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))])
+
+def save_json(d, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(d, f, indent=2)
+
+# -------------------------
+# OVERSAMPLE (flat per-class)
+# -------------------------
+def oversample_all_classes_flat(input_root, balanced_root, seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    clean_folder(balanced_root)
+
+    domains = list_subdirs(input_root)
+    classes = []
+    if domains:
+        for dom in domains:
+            dom_path = os.path.join(input_root, dom)
+            subcls = list_subdirs(dom_path)
+            if subcls:
+                for sc in subcls:
+                    classes.append((dom, sc, os.path.join(dom_path, sc)))
+    else:
+        # flat class folders under input_root
+        cls_list = list_subdirs(input_root)
+        classes = [(None, cls, os.path.join(input_root, cls)) for cls in cls_list]
+
+    files_per_class = {}
+    for dom, cls, cls_path in classes:
+        files = [os.path.join(cls_path, f) for f in os.listdir(cls_path) if os.path.isfile(os.path.join(cls_path, f))]
+        files_per_class[cls] = files
+
+    if not files_per_class:
+        raise ValueError(f"No class folders found under {input_root}.")
+
+    max_count = max(len(v) for v in files_per_class.values() if len(v) > 0)
+    if max_count == 0:
+        raise ValueError("No image files found in any class folder.")
+
+    print("Classes found and file counts:")
+    for k, v in files_per_class.items():
+        print(f"  {k}: {len(v)}")
+
+    print(f"Oversampling all classes to {max_count} samples each...")
+
+    for cls, files in files_per_class.items():
+        out_dir = os.path.join(balanced_root, cls)
+        os.makedirs(out_dir, exist_ok=True)
+        if len(files) == 0:
+            print(f"  Warning: class {cls} has 0 files; skipping.")
+            continue
+        replicated = []
+        while len(replicated) < max_count:
+            replicated.extend(files)
+        replicated = replicated[:max_count]
+        for idx, src in enumerate(replicated):
+            ext = os.path.splitext(src)[1]
+            dst = os.path.join(out_dir, f"{cls}_{idx}{ext}")
+            shutil.copy2(src, dst)
+    print("Oversampling complete.")
+
+# -------------------------
+# Split balanced into train/val/test
+# -------------------------
+def split_balanced_to_train_val_test(balanced_root, output_root, ratio=RATIO, seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    if not os.path.exists(balanced_root):
+        raise ValueError(f"Balanced root not found: {balanced_root}")
+
+    clean_folder(output_root)
+    classes = list_subdirs(balanced_root)
+    for cls in classes:
+        cls_path = os.path.join(balanced_root, cls)
+        files = [os.path.join(cls_path, f) for f in os.listdir(cls_path) if os.path.isfile(os.path.join(cls_path, f))]
+        random.shuffle(files)
+        n_total = len(files)
+        n_train = int(np.floor(n_total * ratio[0]))
+        n_val = int(np.floor(n_total * ratio[1]))
+        n_test = n_total - n_train - n_val
+
+        for split_name, flist in [('train', files[:n_train]), ('val', files[n_train:n_train+n_val]), ('test', files[n_train+n_val:])]:
+            out_dir = os.path.join(output_root, split_name, cls)
+            os.makedirs(out_dir, exist_ok=True)
+            for f in flist:
+                shutil.copy2(f, out_dir)
+        print(f"{cls}: total={n_total} -> train={n_train}, val={n_val}, test={n_test}")
+
+# -------------------------
+# Data generators
+# -------------------------
+def create_data_generator_colon(dataset_dir, batch_size):
+    colon_datagen = ImageDataGenerator(rescale=1./255,
+                                       rotation_range=40,
+                                       width_shift_range=0.2,
+                                       height_shift_range=0.2,
+                                       shear_range=0.2,
+                                       zoom_range=0.2,
+                                       horizontal_flip=True,
+                                       fill_mode='nearest',
+                                       brightness_range=[0.8, 1.2])
+    colon_train_gen = colon_datagen.flow_from_directory(
+        dataset_dir,
+        target_size=(224, 224),
+        batch_size=batch_size,
+        class_mode='sparse',
+        classes=['colon_aca', 'colon_n'],
+        shuffle=True
+    )
+    return colon_train_gen
+
+def create_data_generator_lung(dataset_dir, batch_size):
+    lung_datagen = ImageDataGenerator(rescale=1./255,
+                                      rotation_range=40,
+                                      width_shift_range=0.2,
+                                      height_shift_range=0.0,
+                                      shear_range=0.2,
+                                      zoom_range=0.2,
+                                      horizontal_flip=True,
+                                      fill_mode='nearest',
+                                      brightness_range=[0.8, 1.2])
+    lung_train_gen = lung_datagen.flow_from_directory(
+        dataset_dir,
+        target_size=(224, 224),
+        batch_size=batch_size,
+        class_mode='sparse',
+        classes=['lung_aca', 'lung_n', 'lung_scc'],
+        shuffle=True
+    )
+    return lung_train_gen
+
+# -------------------------
+# Fusion generator for BOHB worker
+# -------------------------
+class FusionDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, colon_gen, lung_gen, batch_size, steps_per_epoch, num_classes=5):
+        self.colon_gen = colon_gen
+        self.lung_gen = lung_gen
+        self.batch_size = batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.colon_iterator = iter(self.colon_gen)
+        self.lung_iterator = iter(self.lung_gen)
+        self.num_classes = num_classes
+        self.current_index = 0
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+    def __getitem__(self, index):
+        try:
+            colon_images, colon_labels = next(self.colon_iterator)
+        except StopIteration:
+            self.colon_iterator = iter(self.colon_gen)
+            colon_images, colon_labels = next(self.colon_iterator)
+
+        try:
+            lung_images, lung_labels = next(self.lung_iterator)
+        except StopIteration:
+            self.lung_iterator = iter(self.lung_gen)
+            lung_images, lung_labels = next(self.lung_iterator)
+
+        lung_labels = lung_labels + 2  # adjust labels offset
+        images = np.concatenate([colon_images, lung_images], axis=0)
+        labels = np.concatenate([colon_labels, lung_labels], axis=0)
+        return images, labels
+
+# -------------------------
+# CNN model for feature extraction
+# -------------------------
+from tensorflow.keras import layers as _layers
+from tensorflow.keras.regularizers import l2 as _l2
+
+def build_cnn_model(input_shape=(224,224,3), learning_rate=0.0003176, num_classes=5, dropout_rate=0.5, weight_decay=1e-4, dataset_type='lung'):
+    inp = Input(shape=input_shape, name='cnn_input')
+    if dataset_type == 'lung':
+        base = DenseNet201(weights='imagenet', include_top=False, input_shape=input_shape)
+    else:
+        base = EfficientNetV2M(weights='imagenet', include_top=False, input_shape=input_shape)
+
+    base.trainable = False
+    x = base(inp)
+    x = _layers.GlobalAveragePooling2D()(x)
+    x = _layers.Dense(512, activation='relu', kernel_regularizer=_l2(weight_decay))(x)
+    x = _layers.Dropout(dropout_rate)(x)
+    x = _layers.Dense(256, activation='relu', kernel_regularizer=_l2(weight_decay), name='penultimate')(x)
+    x = _layers.Dropout(dropout_rate)(x)
+    out = _layers.Dense(num_classes, activation='softmax', name='predictions')(x)
+
+    model = Model(inputs=inp, outputs=out, name=f'cnn_{dataset_type}')
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+def extract_features_from_cnn(model, generator, steps=5):
+    try:
+        feature_layer = model.get_layer('penultimate').output
+        feature_model = Model(inputs=model.input, outputs=feature_layer)
+    except Exception:
+        feature_model = Model(inputs=model.input, outputs=model.layers[-2].output)
+
+    feats, labels = [], []
+    gen_iter = iter(generator)
+    for _ in range(steps):
+        try:
+            images, labs = next(gen_iter)
+        except StopIteration:
+            gen_iter = iter(generator)
+            images, labs = next(gen_iter)
+        f = feature_model.predict(images, verbose=0)
+        feats.append(f)
+        labels.append(labs)
+    if len(feats) == 0:
+        return np.empty((0,)), np.empty((0,))
+    return np.vstack(feats), np.hstack(labels)
+
+# -------------------------
+# Plot helpers
+# -------------------------
+def plot_keras_history(history, prefix='cnn_lung'):
+    hist = history.history
+    fig, ax = plt.subplots()
+    ax.plot(hist['loss'], label='train_loss')
+    ax.plot(hist['val_loss'], label='val_loss')
+    ax.set_title(f'{prefix} Loss')
+    ax.legend()
+    path = os.path.join(plots_dir, f'{prefix}_loss.png')
+    plt.savefig(path)
+    plt.close(fig)
+
+    fig, ax = plt.subplots()
+    ax.plot(hist['accuracy'], label='train_acc')
+    ax.plot(hist['val_accuracy'], label='val_acc')
+    ax.set_title(f'{prefix} Accuracy')
+    ax.legend()
+    path = os.path.join(plots_dir, f'{prefix}_accuracy.png')
+    plt.savefig(path)
+    plt.close(fig)
+
+def plot_catboost_evals(cb_model, prefix='catboost'):
+    try:
+        ev = cb_model.get_evals_result()
+    except Exception:
+        ev = None
+    if not ev:
+        return
+    for dataset_name, metrics in ev.items():
+        for metric_name, values in metrics.items():
+            fig, ax = plt.subplots()
+            ax.plot(values, label=f'{dataset_name}_{metric_name}')
+            ax.set_title(f'CatBoost {metric_name} ({dataset_name})')
+            ax.legend()
+            path = os.path.join(plots_dir, f"{prefix}_{dataset_name}_{metric_name}.png")
+            plt.savefig(path)
+            plt.close(fig)
+
+# -------------------------
+# Confusion Matrix Helper
+# -------------------------
+def save_confusion_matrix(y_true, y_pred, split_name, class_names=None):
+    if class_names is None:
+        class_names = ['colon_aca', 'colon_n', 'lung_aca', 'lung_n', 'lung_scc']
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(cm, display_labels=class_names)
+    fig, ax = plt.subplots(figsize=(8,6))
+    disp.plot(ax=ax, cmap=plt.cm.Blues, values_format='d')
+    plt.title(f"{split_name.capitalize()} Confusion Matrix")
+    plt.tight_layout()
+    path = os.path.join(plots_dir, f"{split_name}_confusion_matrix.png")
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"Saved {split_name} confusion matrix to {path}")
+    return cm
+
+# -------------------------
+# BOHB Worker
+# -------------------------
+class CNNCatBoostWorker(Worker):
+    def compute(self, config, budget, *args, **kwargs):
+        colon_dataset_dir = os.path.join(original_dataset_dir, 'colon')
+        lung_dataset_dir = os.path.join(original_dataset_dir, 'lung')
+
+        learning_rate = config['learning_rate']
+        dropout_rate = float(config['dropout_rate'])
+        weight_decay = float(config['weight_decay'])
+        depth = int(config['depth'])
+        iterations = int(config['iterations'])
+        lr_catboost = float(config['lr_catboost'])
+
+        # Generators
+        colon_train_gen = create_data_generator_colon(colon_dataset_dir, batch_size=8)
+        lung_train_gen = create_data_generator_lung(lung_dataset_dir, batch_size=8)
+
+        colon_val_gen = create_data_generator_colon(colon_dataset_dir, batch_size=8)
+        lung_val_gen = create_data_generator_lung(lung_dataset_dir, batch_size=8)
+
+        colon_test_gen = create_data_generator_colon(colon_dataset_dir, batch_size=8)
+        lung_test_gen = create_data_generator_lung(lung_dataset_dir, batch_size=8)
+
+        train_gen = FusionDataGenerator(colon_train_gen, lung_train_gen, batch_size=8, steps_per_epoch=5, num_classes=5)
+        val_gen = FusionDataGenerator(colon_val_gen, lung_val_gen, batch_size=8, steps_per_epoch=5, num_classes=5)
+        test_gen = FusionDataGenerator(colon_test_gen, lung_test_gen, batch_size=8, steps_per_epoch=5, num_classes=5)
+
+        # Build CNNs
+        cnn_lung = build_cnn_model(input_shape=(224,224,3), learning_rate=learning_rate, num_classes=5,
+                                   dropout_rate=dropout_rate, weight_decay=weight_decay, dataset_type='lung')
+        cnn_colon = build_cnn_model(input_shape=(224,224,3), learning_rate=learning_rate, num_classes=5,
+                                    dropout_rate=dropout_rate, weight_decay=weight_decay, dataset_type='colon')
+
+        # Train CNN lung briefly
+        epochs_to_run = max(1, int(budget))
+        ckpt_path = os.path.join(plots_dir, f'best_cnn_lung_{int(time.time())}.h5')
+        checkpoint = ModelCheckpoint(ckpt_path, monitor='val_loss', save_best_only=True, mode='min', verbose=0)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-7, verbose=1)
+        early_stop = EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True, verbose=1)
+
+        history = cnn_lung.fit(train_gen, epochs=epochs_to_run, validation_data=val_gen,
+                               steps_per_epoch=5, validation_steps=5,
+                               callbacks=[checkpoint, reduce_lr, early_stop])
+        try: plot_keras_history(history, prefix='cnn_lung')
+        except Exception: pass
+
+        # Extract features
+        train_feats_lung, train_labels = extract_features_from_cnn(cnn_lung, train_gen, steps=5)
+        val_feats_lung, val_labels = extract_features_from_cnn(cnn_lung, val_gen, steps=5)
+        test_feats_lung, test_labels = extract_features_from_cnn(cnn_lung, test_gen, steps=5)
+
+        train_feats_colon, _ = extract_features_from_cnn(cnn_colon, train_gen, steps=5)
+        val_feats_colon, _ = extract_features_from_cnn(cnn_colon, val_gen, steps=5)
+        test_feats_colon, _ = extract_features_from_cnn(cnn_colon, test_gen, steps=5)
+
+        X_train = np.hstack([train_feats_lung, train_feats_colon])
+        X_val = np.hstack([val_feats_lung, val_feats_colon])
+        X_test = np.hstack([test_feats_lung, test_feats_colon])
+
+        # CatBoost
+        model_catboost = CatBoostClassifier(iterations=iterations, learning_rate=lr_catboost, depth=depth,
+                                            loss_function='MultiClass', verbose=0)
+        model_catboost.fit(X_train, train_labels, eval_set=(X_val, val_labels), verbose=200)
+        try: plot_catboost_evals(model_catboost, prefix='catboost')
+        except Exception: pass
+
+        # Predictions
+        train_preds = model_catboost.predict(X_train)
+        val_preds = model_catboost.predict(X_val)
+        test_preds = model_catboost.predict(X_test)
+
+        # Accuracy
+        train_acc = accuracy_score(train_labels, train_preds)
+        val_acc = accuracy_score(val_labels, val_preds)
+        test_acc = accuracy_score(test_labels, test_preds)
+        print(f"Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
+
+        # Save confusion matrices
+        save_confusion_matrix(train_labels, train_preds, split_name='train')
+        save_confusion_matrix(val_labels, val_preds, split_name='val')
+        save_confusion_matrix(test_labels, test_preds, split_name='test')
+
+        # Save model and metadata
+        timestamp = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        run_dir = os.path.join(outputs_root, f"run_{timestamp}")
+        os.makedirs(run_dir, exist_ok=True)
+        model_catboost.save_model(os.path.join(run_dir, 'catboost_bohb_model.cbm'))
+        try: shutil.copy2(ckpt_path, os.path.join(run_dir, os.path.basename(ckpt_path)))
+        except Exception: pass
+
+        meta = {
+            'config': dict(config),
+            'budget': int(budget),
+            'train_accuracy': float(train_acc),
+            'val_accuracy': float(val_acc),
+            'test_accuracy': float(test_acc),
+            'timestamp_utc': timestamp,
+            'learning_rate': learning_rate
+        }
+        save_json(meta, os.path.join(run_dir, 'metadata.json'))
+
+        return {'loss': -val_acc,
+                'info': {'train_accuracy': float(train_acc),
+                         'val_accuracy': float(val_acc),
+                         'test_accuracy': float(test_acc),
+                         'run_dir': run_dir}}
+
+# -------------------------
+# Main quick test
+# -------------------------
+if __name__ == '__main__':
+    print("STEP 1: Oversample and split...")
+    oversample_all_classes_flat(original_dataset_dir, balanced_temp_dir, seed=SEED)
+    split_balanced_to_train_val_test(balanced_temp_dir, split_dataset_dir, ratio=RATIO, seed=SEED)
+
+    for split in ['train','val','test']:
+        spath = os.path.join(split_dataset_dir, split)
+        if not os.path.exists(spath):
+            continue
+        for cls in sorted(os.listdir(spath)):
+            cls_path = os.path.join(spath, cls)
+            cnt = len([f for f in os.listdir(cls_path) if os.path.isfile(os.path.join(cls_path, f))])
+            print((split, cls), cnt)
+
+    worker = CNNCatBoostWorker(run_id='worker_test')
+    config_space = CS.ConfigurationSpace()
+    test_config = {'learning_rate': 0.001, 'dropout_rate': 0.3, 'weight_decay': 1e-5, 'depth': 6, 'iterations': 1500, 'lr_catboost': 0.1}
+    res = worker.compute(config=test_config, budget=5000)
+    print('Smoke test result:', res)
+
+# -------------------------
+# Pyro4 NameServer connection via ngrok
+# -------------------------
+NGROK_HOST = "0.tcp.in.ngrok.io"
+NGROK_PORT = 17473
+
+Pyro4.config.NS_HOST = NGROK_HOST
+Pyro4.config.NS_PORT = NGROK_PORT
+
+print(f"Trying to reach Pyro4 NameServer via ngrok at {NGROK_HOST}:{NGROK_PORT}...\n")
+
+try:
+    ns = Pyro4.locateNS()
+    print("✅ SUCCESS: Connected to remote Pyro4 NameServer!")
+
+    print("\nRegistered objects:")
+    for name, uri in ns.list().items():
+        print(f" - {name}: {uri}")
+
+except Exception as e:
+    print("❌ FAILED: Could not connect to the NameServer.")
+    print("Error:", e)

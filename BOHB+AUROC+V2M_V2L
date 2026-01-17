@@ -1,497 +1,383 @@
 # ============================================================
-# FINAL STABLE PIPELINE - SAFE VERSION
-# Domain-aware Oversampling + CNN + CatBoost + ROC/AUROC + Time  ( Final Working code)
+# updated_full_balanced_pipeline_bohb_catboost_auroc_final.py  
 # ============================================================
 
 import os
 import shutil
 import random
 import time
-import json
-import datetime # Import the datetime module
 import numpy as np
 import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings("ignore")
 
-# -------------------------
-# TensorFlow / Keras
-# -------------------------
 import tensorflow as tf
-from tensorflow.keras import Model
-from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import Dense, Dropout, Concatenate, BatchNormalization, GlobalAveragePooling2D
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import DenseNet201, EfficientNetV2M , EfficientNetV2L # Added EfficientNetV2M
-from tensorflow.keras.regularizers import l2
+from tensorflow.keras.applications import DenseNet201, EfficientNetV2L, EfficientNetV2M
 
-# -------------------------
-# Metrics
-# -------------------------
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, accuracy_score
-from sklearn.metrics import roc_curve, auc, roc_auc_score # Added roc_auc_score
+from sklearn.metrics import (confusion_matrix, ConfusionMatrixDisplay,
+                             classification_report, precision_score, recall_score,
+                             f1_score, accuracy_score, roc_curve, auc, roc_auc_score)
+from sklearn.utils.class_weight import compute_class_weight
 from sklearn.preprocessing import label_binarize
 
-# -------------------------
-# CatBoost
-# -------------------------
 from catboost import CatBoostClassifier
-
-# -------------------------
-# BOHB / Pyro
-# -------------------------
-from hpbandster.core.worker import Worker
 import Pyro4
-
-# ============================================================
-# CONFIG
-# ============================================================
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
-
-original_dataset_dir = "/content/Project_Sample"
-balanced_temp_dir   = "/content/Project_Sample_balanced"
-split_dataset_dir   = "/content/Project_Sample_split"
-
-outputs_root = "./runs"
-plots_dir = os.path.join(outputs_root, "plots")
-os.makedirs(plots_dir, exist_ok=True)
-
-RATIO = (0.7, 0.15, 0.15)
-BATCH_SIZE = 32
-EPOCHS = 15
-
-CLASS_NAMES_COLON = ['colon_aca', 'colon_n']
-CLASS_NAMES_LUNG = ['lung_aca', 'lung_n', 'lung_scc']
-GLOBAL_CLASS_NAMES = CLASS_NAMES_COLON + CLASS_NAMES_LUNG # Total 5 classes
-N_CLASSES = len(GLOBAL_CLASS_NAMES)
-
-# ============================================================
-# UTILITIES
-# ============================================================
-def clean_folder(path):
-    if os.path.exists(path):
-        shutil.rmtree(path)
-    os.makedirs(path, exist_ok=True)
-
-def save_json(d, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(d, f, indent=2)
-
-# ============================================================
-# DOMAIN-AWARE OVERSAMPLING
-# ============================================================
-def oversample_all_classes_flat(input_root, balanced_root, seed=SEED):
-    random.seed(seed)
-    np.random.seed(seed)
-    clean_folder(balanced_root)
-
-    files_per_class = {}
-    # Correctly identify actual class folders, even if nested under domain folders
-    for domain_or_class_dir in os.listdir(input_root):
-        current_path = os.path.join(input_root, domain_or_class_dir)
-        if not os.path.isdir(current_path) or domain_or_class_dir.startswith('.'):
-            continue
-
-        # Check if this is a domain folder (e.g., 'colon', 'lung') or directly a class folder (e.g., 'colon_aca')
-        sub_dirs = [d for d in os.listdir(current_path) if os.path.isdir(os.path.join(current_path, d))]
-        if any(sc in GLOBAL_CLASS_NAMES for sc in sub_dirs): # Likely a domain folder
-            for cls_name in sub_dirs:
-                cls_path = os.path.join(current_path, cls_name)
-                images = [
-                    os.path.join(cls_path, f)
-                    for f in os.listdir(cls_path)
-                    if f.lower().endswith(('.png','.jpg','.jpeg'))
-                ]
-                files_per_class[cls_name] = images
-                print(f"{cls_name}: {len(images)} images")
-        else: # Assumed to be a flat class folder
-            cls_name = domain_or_class_dir
-            images = [
-                os.path.join(current_path, f)
-                for f in os.listdir(current_path)
-                if f.lower().endswith(('.png','.jpg','.jpeg'))
-            ]
-            files_per_class[cls_name] = images
-            print(f"{cls_name}: {len(images)} images")
-
-
-    non_empty = {k:v for k,v in files_per_class.items() if len(v) > 0}
-    if not non_empty:
-        raise ValueError("❌ No images found in dataset")
-
-    max_count = max(len(v) for v in non_empty.values())
-    print(f"\nOversampling all classes to {max_count} samples each\n")
-
-    for cls, files in files_per_class.items():
-        if len(files) == 0:
-            continue
-        out_dir = os.path.join(balanced_root, cls)
-        os.makedirs(out_dir, exist_ok=True)
-        replicated = (files * (max_count // len(files) + 1))[:max_count]
-        for i, src in enumerate(replicated):
-            ext = os.path.splitext(src)[1]
-            shutil.copy2(src, os.path.join(out_dir, f"{cls}_{i}{ext}"))
-
-    print("✅ Oversampling completed")
-
-# ============================================================
-# SPLIT DATASET
-# ============================================================
-def split_balanced_to_train_val_test(balanced_root, output_root, ratio=RATIO):
-    clean_folder(output_root)
-    for cls in sorted(os.listdir(balanced_root)):
-        cls_path = os.path.join(balanced_root, cls)
-        if not os.path.isdir(cls_path): # Skip non-directories
-            continue
-
-        files = os.listdir(cls_path)
-        random.shuffle(files)
-
-        n = len(files)
-        n_train = int(n * ratio[0])
-        n_val = int(n * ratio[1])
-
-        splits = {
-            "train": files[:n_train],
-            "val": files[n_train:n_train+n_val],
-            "test": files[n_train+n_val:]
-        }
-
-        for split, flist in splits.items():
-            out = os.path.join(output_root, split, cls)
-            os.makedirs(out, exist_ok=True)
-            for f in flist:
-                shutil.copy2(os.path.join(balanced_root, cls, f), out)
-
-# ============================================================
-# DATA GENERATOR
-# ============================================================
-def create_generator(path, classes, shuffle=True):
-    gen = ImageDataGenerator(rescale=1./255)
-    return gen.flow_from_directory(
-        path,
-        target_size=(224,224),
-        batch_size=BATCH_SIZE,
-        class_mode='sparse',
-        classes=classes, # Pass specific classes
-        shuffle=shuffle
-    )
-
-# ============================================================
-# CNN MODEL
-# ============================================================
-def build_cnn(domain_type, lr, dropout, weight_decay):
-    num_output_classes = len(CLASS_NAMES_COLON) if domain_type == 'colon' else len(CLASS_NAMES_LUNG)
-
-    # Use DenseNet201 for colon and EfficientNetV2M for lung
-   # base_model_cls = DenseNet201 if domain_type == 'colon' else EfficientNetV2M
-
-    # Use DenseNet201 for colon and EfficientNetV2L for lung
-    base_model_cls = DenseNet201 if domain_type == 'colon' else EfficientNetV2L
-
-    base = base_model_cls(weights='imagenet', include_top=False, input_shape=(224,224,3))
-    base.trainable = False
-
-    x_input = base.input # Explicitly define the input tensor
-    x = GlobalAveragePooling2D()(base.output)
-    x = Dense(256, activation='relu', name="penultimate", kernel_regularizer=l2(weight_decay))(x)
-    x = Dropout(dropout)(x) # This is the line that caused the error
-    out = Dense(num_output_classes, activation='softmax')(x)
-
-    model = Model(base.input, out)
-    model.compile(
-        optimizer=Adam(lr),
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    return model
-
-# ============================================================
-# FEATURE EXTRACTION
-# ============================================================
-def extract_features(model, generator, steps):
-    feat_model = Model(model.input, model.get_layer("penultimate").output)
-    feats, labs = [], []
-
-    # Iterate through the generator for the specified number of steps
-    for i in range(steps):
-        x, y = generator[i] # Access generator by index
-        feats.append(feat_model.predict(x, verbose=0))
-        labs.append(y)
-
-    return np.vstack(feats), np.hstack(labs)
-
-# ============================================================
-# CONFUSION MATRIX
-# ============================================================
-def save_confusion_matrix(y_true, y_pred, split_name):
-    # Ensure y_pred is 1D for concatenation if it comes as (N, 1)
-    if y_pred.ndim > 1:
-        y_pred = y_pred.flatten()
-
-    # Filter out labels that are not present in either y_true or y_pred but are in GLOBAL_CLASS_NAMES
-    # This ensures display_labels matches existing labels
-    present_labels = np.unique(np.concatenate([y_true, y_pred])).astype(int)
-    display_labels_names = [GLOBAL_CLASS_NAMES[i] for i in present_labels]
-
-    cm = confusion_matrix(y_true, y_pred, labels=present_labels)
-    disp = ConfusionMatrixDisplay(cm, display_labels=display_labels_names)
-    fig, ax = plt.subplots(figsize=(8,6))
-    disp.plot(ax=ax, cmap=plt.cm.Blues, values_format='d')
-    plt.title(f"{split_name.capitalize()} Confusion Matrix")
-    plt.tight_layout()
-    path = os.path.join(plots_dir, f"{split_name}_confusion_matrix.png")
-    plt.savefig(path)
-    plt.close(fig)
-    print(f"Saved {split_name} confusion matrix to {path}")
-    return cm
-
-# ============================================================
-# ROC / AUROC
-# ============================================================
-def compute_macro_roc(y_true, y_prob, split):
-    # Ensure y_true contains all classes that might be in y_prob for binarization
-    # Map y_true to a 0 to N-1 range where N is the total number of global classes
-    y_true_mapped = np.array(y_true, dtype=int)
-
-    # Binarize labels considering all possible global classes
-    y_bin = label_binarize(y_true_mapped, classes=list(range(N_CLASSES)))
-
-    # Adjust y_prob if it contains probabilities for fewer classes than N_CLASSES
-    # This happens if a domain-specific model is used and its output is directly passed here
-    if y_prob.shape[1] < N_CLASSES:
-        # Create a new y_prob array with N_CLASSES columns, filling missing with 0s
-        full_y_prob = np.zeros((y_prob.shape[0], N_CLASSES))
-        # Assuming colon classes are 0,1 and lung classes are 2,3,4
-        # This part needs careful handling based on how y_prob is generated.
-        # If y_prob is from the final combined CatBoost model, it already has N_CLASSES.
-        # If this is for intermediate steps, it would require more context.
-        # For the final CatBoost predictions, y_prob should already have N_CLASSES columns.
-        pass # No change needed if y_prob is already 5-column from combined CatBoost
-
-    fpr, tpr = {}, {}
-    for i in range(N_CLASSES):
-        # Only compute ROC for classes actually present in y_true_mapped
-        if i in np.unique(y_true_mapped):
-            fpr[i], tpr[i], _ = roc_curve(y_bin[:, i], y_prob[:, i])
-        else:
-            # If a class is not present, plot a diagonal line for its ROC
-            fpr[i], tpr[i] = np.array([0., 1.]), np.array([0., 1.])
-
-    all_fpr = np.unique(np.concatenate([fpr[i] for i in range(N_CLASSES)]))
-    mean_tpr = np.zeros_like(all_fpr)
-    count_present_classes = 0
-    for i in range(N_CLASSES):
-        if i in np.unique(y_true_mapped):
-            mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
-            count_present_classes += 1
-    if count_present_classes > 0:
-        mean_tpr /= count_present_classes
-    else:
-        mean_tpr = all_fpr # If no classes, default to random classifier line
-
-    macro_auc = auc(all_fpr, mean_tpr)
-
-    plt.figure()
-    plt.plot(all_fpr, mean_tpr, label=f"Macro AUC = {macro_auc:.4f}")
-    plt.plot([0,1],[0,1],'k--')
-    plt.xlabel("FPR")
-    plt.ylabel("TPR")
-    plt.title(f"{split} Macro ROC")
-    plt.legend()
-    plt.savefig(os.path.join(plots_dir, f"{split}_macro_roc.png"))
-    plt.close()
-    return macro_auc
-
-# ============================================================
-# TIME TRACKER
-# ============================================================
-class TimeTracker:
-    def __init__(self):
-        self.start = time.time()
-    def stop(self):
-        return time.time() - self.start
-
-# ============================================================
-# BOHB WORKER
-# ============================================================
-class CNNCatBoostWorker(Worker):
-    def compute(self, config, budget, *args, **kwargs):
-        timer = TimeTracker()
-
-        # Create domain-specific generators from the split_dataset_dir
-        train_colon_gen = create_generator(os.path.join(split_dataset_dir, 'train'), CLASS_NAMES_COLON)
-        train_lung_gen = create_generator(os.path.join(split_dataset_dir, 'train'), CLASS_NAMES_LUNG)
-        val_colon_gen = create_generator(os.path.join(split_dataset_dir, 'val'), CLASS_NAMES_COLON, shuffle=False)
-        val_lung_gen = create_generator(os.path.join(split_dataset_dir, 'val'), CLASS_NAMES_LUNG, shuffle=False)
-        test_colon_gen = create_generator(os.path.join(split_dataset_dir, 'test'), CLASS_NAMES_COLON, shuffle=False)
-        test_lung_gen = create_generator(os.path.join(split_dataset_dir, 'test'), CLASS_NAMES_LUNG, shuffle=False)
-
-        # Build and train colon CNN
-        cnn_colon = build_cnn('colon', config['learning_rate'], config['dropout_rate'], config['weight_decay'])
-        cnn_colon.fit(train_colon_gen, epochs=EPOCHS, # Use EPOCHS from config
-                              validation_data=val_colon_gen,
-                              steps_per_epoch=len(train_colon_gen),
-                              validation_steps=len(val_colon_gen),
-                              verbose=0)
-
-        # Build and train lung CNN
-        cnn_lung = build_cnn('lung', config['learning_rate'], config['dropout_rate'], config['weight_decay'])
-        cnn_lung.fit(train_lung_gen, epochs=EPOCHS, # Use EPOCHS from config
-                             validation_data=val_lung_gen,
-                             steps_per_epoch=len(train_lung_gen),
-                             validation_steps=len(val_lung_gen),
-                             verbose=0)
-
-        # Extract features from both CNNs for the full dataset splits
-        t_feat_start = time.time()
-        X_train_colon_feats, y_train_colon_labels_raw = extract_features(cnn_colon, train_colon_gen, steps=len(train_colon_gen))
-        X_train_lung_feats, y_train_lung_labels_raw = extract_features(cnn_lung, train_lung_gen, steps=len(train_lung_gen))
-
-        X_val_colon_feats, y_val_colon_labels_raw = extract_features(cnn_colon, val_colon_gen, steps=len(val_colon_gen))
-        X_val_lung_feats, y_val_lung_labels_raw = extract_features(cnn_lung, val_lung_gen, steps=len(val_lung_gen))
-
-        X_test_colon_feats, y_test_colon_labels_raw = extract_features(cnn_colon, test_colon_gen, steps=len(test_colon_gen))
-        X_test_lung_feats, y_test_lung_labels_raw = extract_features(cnn_lung, test_lung_gen, steps=len(test_lung_gen))
-
-        t_feat = time.time() - t_feat_start
-
-        # Remap lung labels and combine features and labels for CatBoost
-        y_train_colon_mapped = y_train_colon_labels_raw
-        y_train_lung_mapped = y_train_lung_labels_raw + len(CLASS_NAMES_COLON)
-
-        y_val_colon_mapped = y_val_colon_labels_raw
-        y_val_lung_mapped = y_val_lung_labels_raw + len(CLASS_NAMES_COLON)
-
-        y_test_colon_mapped = y_test_colon_labels_raw
-        y_test_lung_mapped = y_test_lung_labels_raw + len(CLASS_NAMES_COLON)
-
-        # Combine features and labels
-        X_train_combined = np.vstack([X_train_colon_feats, X_train_lung_feats])
-        y_train_combined = np.hstack([y_train_colon_mapped, y_train_lung_mapped])
-
-        X_val_combined = np.vstack([X_val_colon_feats, X_val_lung_feats])
-        y_val_combined = np.hstack([y_val_colon_mapped, y_val_lung_mapped])
-
-        X_test_combined = np.vstack([X_test_colon_feats, X_test_lung_feats])
-        y_test_combined = np.hstack([y_test_colon_mapped, y_test_lung_mapped])
-
-        # CatBoost training
-        t_cb_start = time.time()
-        cb = CatBoostClassifier(
-            iterations=config['iterations'],
-            depth=config['depth'],
-            learning_rate=config['lr_catboost'],
-            loss_function='MultiClass',
-            verbose=0,
-            random_seed=SEED # Ensure reproducibility
-        )
-        cb.fit(X_train_combined, y_train_combined, eval_set=(X_val_combined, y_val_combined), verbose=0)
-        t_cb = time.time() - t_cb_start
-
-        # Predictions and evaluation on all sets
-        t_pred_start = time.time()
-        train_probs_combined = cb.predict_proba(X_train_combined)
-        train_preds_combined = cb.predict(X_train_combined).flatten() # Flatten output
-
-        val_probs_combined = cb.predict_proba(X_val_combined)
-        val_preds_combined = cb.predict(X_val_combined).flatten() # Flatten output
-
-        test_probs_combined = cb.predict_proba(X_test_combined)
-        test_preds_combined = cb.predict(X_test_combined).flatten() # Flatten output
-        t_pred = time.time() - t_pred_start
-
-        # Accuracies
-        train_accuracy = accuracy_score(y_train_combined, train_preds_combined)
-        val_accuracy = accuracy_score(y_val_combined, val_preds_combined)
-        test_accuracy = accuracy_score(y_test_combined, test_preds_combined)
-
-        # Macro AUCs
-        train_macro_auc = compute_macro_roc(y_train_combined, train_probs_combined, "train")
-        val_macro_auc = compute_macro_roc(y_val_combined, val_probs_combined, "val")
-        test_macro_auc = compute_macro_roc(y_test_combined, test_probs_combined, "test")
-
-        # Confusion matrices (using flattened predictions)
-        save_confusion_matrix(y_train_combined, train_preds_combined, "train")
-        save_confusion_matrix(y_val_combined, val_preds_combined, "val")
-        save_confusion_matrix(y_test_combined, test_preds_combined, "test")
-
-        total_time = timer.stop()
-
-        # Save model and metadata
-        timestamp = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-        run_dir = os.path.join(outputs_root, f"run_{timestamp}")
-        os.makedirs(run_dir, exist_ok=True)
-        cb.save_model(os.path.join(run_dir, 'catboost_bohb_model.cbm'))
-        cnn_colon.save(os.path.join(run_dir, 'cnn_colon.h5'))
-        cnn_lung.save(os.path.join(run_dir, 'cnn_lung.h5'))
-
-        meta = {
-            "config": config,
-            "budget": budget,
-            "train_accuracy": float(train_accuracy),
-            "val_accuracy": float(val_accuracy),
-            "test_accuracy": float(test_accuracy),
-            "train_macro_auc": float(train_macro_auc),
-            "val_macro_auc": float(val_macro_auc),
-            "test_macro_auc": float(test_macro_auc),
-            "time_feature_sec": round(t_feat,2),
-            "time_catboost_sec": round(t_cb,2),
-            "time_inference_sec": round(t_pred,2),
-            "time_total_sec": round(total_time, 2)
-        }
-        save_json(meta, os.path.join(run_dir, 'metadata.json'))
-
-        return {"loss": -val_accuracy, "info": meta}
-
-# ============================================================
-# MAIN
-# ============================================================
-if __name__ == "__main__":
-    print("\nSTEP 1: Oversampling")
-    oversample_all_classes_flat(original_dataset_dir, balanced_temp_dir)
-
-    print("\nSTEP 2: Splitting")
-    split_balanced_to_train_val_test(balanced_temp_dir, split_dataset_dir)
-
-    # Display counts after splitting
-    print("\n--- Split Counts ---")
-    for split_name in ['train','val','test']:
-        split_path = os.path.join(split_dataset_dir, split_name)
-        if os.path.exists(split_path):
-            for cls_name in sorted(os.listdir(split_path)):
-                cls_dir = os.path.join(split_path, cls_name)
-                if os.path.isdir(cls_dir):
-                    print(f"{split_name} {cls_name}: {len(os.listdir(cls_dir))} images")
-        else:
-            print(f"Warning: {split_path} does not exist.")
-
-
-    worker = CNNCatBoostWorker(run_id="final_run")
-    test_config = {
-        'learning_rate': 0.001,
-        'dropout_rate': 0.3,
-        'weight_decay': 1e-5, # Added weight_decay to config
-        'depth': 6,
-        'iterations': 500,
-        'lr_catboost': 0.1
-    }
-    result = worker.compute(test_config, budget=1) # Pass test_config and budget
-    print("\nRESULT:", result)
 
 # ============================================================
 # PYRO4 NAMESERVER (NGROK)
 # ============================================================
 Pyro4.config.NS_HOST = "0.tcp.in.ngrok.io"
-Pyro4.config.NS_PORT = 17178
-Pyro4.config.COMMTIMEOUT = 5 # Add a timeout to prevent hanging
+Pyro4.config.NS_PORT = 13923
+Pyro4.config.COMMTIMEOUT = 5  # Add a timeout to prevent hanging
 
 try:
     Pyro4.locateNS()
     print("✅ Connected to Pyro4 NameServer")
 except Exception as e:
     print("❌ Pyro4 NameServer failed:", e)
+
+# -------------------------
+# USER CONFIG
+# -------------------------
+original_dataset_dir = "/content/Project_Sample"
+balanced_temp_dir   = "/content/Project_Sample_balanced"
+split_dataset_dir   = "/content/Project_Sample_split_bal"
+plots_dir = "./plots"
+os.makedirs(plots_dir, exist_ok=True)
+
+RATIO = (0.7, 0.15, 0.15)
+SEED = 42
+batch_size = 8
+epochs = 50
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+# -------------------------
+# UTILITIES
+# -------------------------
+def clean_folder(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+
+def list_subdirs(path):
+    """List only non-hidden directories"""
+    if not os.path.exists(path):
+        return []
+    return sorted([d for d in os.listdir(path)
+                   if os.path.isdir(os.path.join(path, d)) and not d.startswith(".")])
+
+# -------------------------
+# OVERSAMPLE (flat per-class)
+# -------------------------
+def oversample_all_classes_flat(input_root, balanced_root, seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    clean_folder(balanced_root)
+
+    # find all class folders recursively
+    classes = []
+    for domain in list_subdirs(input_root):
+        domain_path = os.path.join(input_root, domain)
+        subcls = list_subdirs(domain_path)
+        if subcls:
+            for sc in subcls:
+                classes.append((domain, sc, os.path.join(domain_path, sc)))
+        else:
+            classes.append((None, domain, domain_path))
+
+    files_per_class = {}
+    for dom, cls, cls_path in classes:
+        files = [os.path.join(cls_path, f) for f in os.listdir(cls_path)
+                 if os.path.isfile(os.path.join(cls_path, f)) and f.lower().endswith(('.png','.jpg','.jpeg'))]
+        if files:
+            class_name = cls if dom is None else f"{dom}_{cls}"
+            files_per_class[class_name] = files
+        else:
+            print(f"⚠️ Warning: class '{cls}' has 0 images. Skipping this class.")
+
+    if not files_per_class:
+        raise ValueError("❌ No valid images found in any class folder!")
+
+    max_count = max(len(v) for v in files_per_class.values())
+    print("Classes found and file counts:")
+    for k, v in files_per_class.items():
+        print(f"  {k}: {len(v)}")
+    print(f"Oversampling all classes to {max_count} samples each...")
+
+    for cls, files in files_per_class.items():
+        out_dir = os.path.join(balanced_root, cls)
+        os.makedirs(out_dir, exist_ok=True)
+        replicated = (files * ((max_count // len(files)) + 1))[:max_count]
+        for i, src in enumerate(replicated):
+            ext = os.path.splitext(src)[1]
+            shutil.copy2(src, os.path.join(out_dir, f"{cls}_{i}{ext}"))
+    print("Oversampling complete.")
+    return list(files_per_class.keys())
+
+# -------------------------
+# Split balanced into train/val/test
+# -------------------------
+def split_balanced_to_train_val_test(balanced_root, output_root, ratio=RATIO, seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    if not os.path.exists(balanced_root):
+        raise ValueError(f"Balanced root not found: {balanced_root}")
+
+    clean_folder(output_root)
+    classes = list_subdirs(balanced_root)
+    for cls in classes:
+        cls_path = os.path.join(balanced_root, cls)
+        files = [os.path.join(cls_path, f) for f in os.listdir(cls_path) if os.path.isfile(os.path.join(cls_path, f))]
+        if not files:
+            continue
+        random.shuffle(files)
+        n_total = len(files)
+        n_train = int(np.floor(n_total * ratio[0]))
+        n_val = int(np.floor(n_total * ratio[1]))
+        n_test = n_total - n_train - n_val
+
+        for split_name, flist in [('train', files[:n_train]),
+                                  ('val', files[n_train:n_train+n_val]),
+                                  ('test', files[n_train+n_val:])]:
+            out_dir = os.path.join(output_root, split_name, cls)
+            os.makedirs(out_dir, exist_ok=True)
+            for f in flist:
+                shutil.copy2(f, out_dir)
+        print(f"{cls}: total={n_total} -> train={n_train}, val={n_val}, test={n_test}")
+
+# -------------------------
+# ImageDataGenerator factory
+# -------------------------
+def create_data_generator(dataset_dir, class_list, batch_size, shuffle=True):
+    if not os.path.exists(dataset_dir):
+        raise ValueError(f"Dataset directory does not exist: {dataset_dir}")
+    datagen = ImageDataGenerator(rescale=1./255,
+                                 rotation_range=20,
+                                 width_shift_range=0.1,
+                                 height_shift_range=0.1,
+                                 shear_range=0.1,
+                                 zoom_range=0.1,
+                                 horizontal_flip=True,
+                                 fill_mode='nearest')
+    gen = datagen.flow_from_directory(dataset_dir,
+                                      target_size=(64,64),
+                                      batch_size=batch_size,
+                                      class_mode='sparse',
+                                      classes=class_list,
+                                      shuffle=shuffle)
+    if getattr(gen, "samples", 0) == 0:
+        raise ValueError(f"Generator for {dataset_dir} has 0 samples.")
+    return gen
+
+# -------------------------
+# Single-branch pair generator
+# -------------------------
+class SimplePairGenerator(tf.keras.utils.Sequence):
+    def __init__(self, image_gen):
+        self.image_gen = image_gen
+        self.steps = len(self.image_gen)
+    def __len__(self):
+        return int(self.steps)
+    def __getitem__(self, idx):
+        x, y = self.image_gen[idx]
+        return (x, x), y
+
+# -------------------------
+# Fusion Model
+# -------------------------
+def create_base_model(base_model, input_shape=(64,64,3), output_dim=128):
+    for layer in base_model.layers[:400]:
+        layer.trainable = False
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dropout(0.5)(x)
+    x = Dense(output_dim, activation='relu')(x)
+    return Model(inputs=base_model.input, outputs=x)
+
+def build_model(dense1_units=512, dropout_rate=0.2, learning_rate=0.0003176, num_classes=5):
+    input_a = Input(shape=(64,64,3))
+    input_b = Input(shape=(64,64,3))
+    base1 = create_base_model(DenseNet201(weights='imagenet', include_top=False, input_shape=(64,64,3)))
+    base2 = create_base_model(EfficientNetV2L(weights='imagenet', include_top=False, input_shape=(64,64,3), include_preprocessing=False))
+    #base2 = create_base_model(EfficientNetV2M(weights='imagenet', include_top=False, input_shape=(64,64,3), include_preprocessing=False))
+    f1 = base1(input_a)
+    f2 = base2(input_b)
+    merged = Concatenate()([f1, f2])
+    x = BatchNormalization()(merged)
+    x = Dense(dense1_units, activation='relu')(x)
+    x = Dropout(dropout_rate)(x)
+    x = BatchNormalization()(x)
+    x = Dense(256, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dense(128, activation='relu')(x)
+    output = Dense(num_classes, activation='softmax')(x)
+    model = Model(inputs=[input_a, input_b], outputs=output)
+    model.compile(optimizer=Adam(learning_rate=learning_rate),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+# -------------------------
+# Feature Extraction
+# -------------------------
+def extract_features_from_fusion_model(model, pair_generator):
+    feature_model = Model(inputs=model.input, outputs=model.layers[-2].output)
+    feats, labs = [], []
+    for i in range(len(pair_generator)):
+        (x1, x2), y = pair_generator[i]
+        f = feature_model.predict([x1, x2], verbose=0)
+        feats.append(f)
+        labs.append(y)
+    if len(feats) == 0:
+        return np.empty((0,)), np.empty((0,))
+    return np.vstack(feats), np.hstack(labs)
+
+# -------------------------
+# Metrics helpers
+# -------------------------
+def evaluate_metrics(y_true, y_pred, name):
+    print(f"\n{name} Metrics:")
+    print(f"Accuracy:  {accuracy_score(y_true, y_pred) * 100:.2f}%")
+    print(f"Precision: {precision_score(y_true, y_pred, average='weighted'):.4f}")
+    print(f"Recall:    {recall_score(y_true, y_pred, average='weighted'):.4f}")
+    print(f"F1 Score:  {f1_score(y_true, y_pred, average='weighted'):.4f}")
+
+def show_conf_matrix_and_report(y_true, y_pred, dataset_name):
+    class_names = sorted(np.unique(y_true).astype(str))
+    print(f"\n--- {dataset_name} Classification Report ---")
+    print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    fig, ax = plt.subplots(figsize=(8,6))
+    disp.plot(ax=ax, cmap=plt.cm.Blues, values_format='d')
+    plt.title(f"{dataset_name} Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------
+# AUROC / ROC / TPR / FPR
+# -------------------------
+def compute_and_plot_roc(y_true, y_prob, class_names, split_name, plots_dir):
+    n_classes = len(class_names)
+    y_true_bin = label_binarize(y_true, classes=range(n_classes))
+    fpr, tpr, roc_auc = {}, {}, {}
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_prob[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+    macro_auc = roc_auc_score(y_true_bin, y_prob, average="macro", multi_class="ovr")
+    print(f"\n{split_name} Macro AUROC: {macro_auc:.4f}")
+
+    plt.figure(figsize=(8, 6))
+    for i, cname in enumerate(class_names):
+        plt.plot(fpr[i], tpr[i], lw=2, label=f"{cname} (AUC={roc_auc[i]:.3f})")
+    plt.plot([0,1],[0,1],'k--',lw=1)
+    plt.xlabel("False Positive Rate (FPR)")
+    plt.ylabel("True Positive Rate (TPR)")
+    plt.title(f"{split_name} ROC Curve (Macro AUC={macro_auc:.4f})")
+    plt.legend(loc="lower right")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    save_path = os.path.join(plots_dir, f"ROC_{split_name}.png")
+    plt.savefig(save_path, dpi=300)
+    plt.show()
+    print(f"ROC curve saved to: {save_path}")
+    return macro_auc
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+    # STEP 1: Oversample
+    print("\nSTEP 1: Oversampling (flat per-class) ...")
+    filtered_classes = oversample_all_classes_flat(original_dataset_dir, balanced_temp_dir)
+
+    # STEP 2: Split dataset
+    print("\nSTEP 2: Splitting balanced dataset ...")
+    split_balanced_to_train_val_test(balanced_temp_dir, split_dataset_dir)
+
+    # STEP 3: Generators
+    print("\nSTEP 3: Creating Image Generators ...")
+    train_gen = SimplePairGenerator(create_data_generator(os.path.join(split_dataset_dir,'train'), filtered_classes, batch_size, shuffle=True))
+    val_gen   = SimplePairGenerator(create_data_generator(os.path.join(split_dataset_dir,'val'), filtered_classes, batch_size, shuffle=False))
+    test_gen  = SimplePairGenerator(create_data_generator(os.path.join(split_dataset_dir,'test'), filtered_classes, batch_size, shuffle=False))
+    print(f"Train samples: {train_gen.image_gen.samples}, Val samples: {val_gen.image_gen.samples}, Test samples: {test_gen.image_gen.samples}")
+
+    # STEP 4: Build & train fusion model
+    print("\nSTEP 4: Training Fusion Model ...")
+    model = build_model(num_classes=len(filtered_classes))
+    es = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1)
+    rlp = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=1e-6, verbose=1)
+    mcp = ModelCheckpoint('best_fusion_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
+    model.fit(train_gen, validation_data=val_gen, epochs=epochs, callbacks=[es, rlp, mcp],
+              steps_per_epoch=len(train_gen), validation_steps=len(val_gen), verbose=1)
+
+    # STEP 5: Feature extraction
+    print("\nSTEP 5: Extracting features ...")
+    X_train_feats, y_train_feats = extract_features_from_fusion_model(model, train_gen)
+    X_val_feats,   y_val_feats   = extract_features_from_fusion_model(model, val_gen)
+    X_test_feats,  y_test_feats  = extract_features_from_fusion_model(model, test_gen)
+
+    # STEP 6: BOHB CatBoost (placeholder)
+    print("\nSTEP 6: BOHB optimization for CatBoost ...")
+    # TODO: integrate BOHB hyperparameter search
+
+    # STEP 7: Train final CatBoost (fixed params example)
+    classes = np.unique(y_train_feats)
+    cw = compute_class_weight('balanced', classes=classes, y=y_train_feats)
+    cat_model = CatBoostClassifier(learning_rate=0.05, depth=6, l2_leaf_reg=3, class_weights=list(cw),
+                                   verbose=0, random_state=SEED)
+    t0 = time.time()
+    cat_model.fit(X_train_feats, y_train_feats)
+    print(f"CatBoost training time: {time.time()-t0:.2f}s")
+
+    # STEP 8: Evaluate
+    y_val_pred = cat_model.predict(X_val_feats)
+    y_test_pred = cat_model.predict(X_test_feats)
+    evaluate_metrics(y_val_feats, y_val_pred, "Validation")
+    show_conf_matrix_and_report(y_val_feats, y_val_pred, "Validation")
+    evaluate_metrics(y_test_feats, y_test_pred, "Test")
+    show_conf_matrix_and_report(y_test_feats, y_test_pred, "Test")
+    cat_model.save_model("catboost_fusion_model.cbm")
+    print("Saved CatBoost model.")
+
+    # STEP 9: Inference + AUROC + Timing
+    print("\n--- Computational Time & AUROC ---")
+    auroc_summary = {}
+
+    # TRAIN
+    t0 = time.time()
+    y_train_prob = cat_model.predict_proba(X_train_feats)
+    train_time = time.time() - t0
+    train_auc = compute_and_plot_roc(y_train_feats, y_train_prob, filtered_classes, "Train", plots_dir)
+    auroc_summary['Train'] = train_auc
+    print(f"Train inference + AUROC time: {train_time:.2f}s")
+
+    # VALIDATION
+    t0 = time.time()
+    y_val_prob = cat_model.predict_proba(X_val_feats)
+    val_time = time.time() - t0
+    val_auc = compute_and_plot_roc(y_val_feats, y_val_prob, filtered_classes, "Validation", plots_dir)
+    auroc_summary['Validation'] = val_auc
+    print(f"Validation inference + AUROC time: {val_time:.2f}s")
+
+    # TEST
+    t0 = time.time()
+    y_test_prob = cat_model.predict_proba(X_test_feats)
+    test_time = time.time() - t0
+    test_auc = compute_and_plot_roc(y_test_feats, y_test_prob, filtered_classes, "Test", plots_dir)
+    auroc_summary['Test'] = test_auc
+    print(f"Test inference + AUROC time: {test_time:.2f}s")
+
+    # AUROC Summary Table
+    print("\n--- AUROC Summary ---")
+    for split, auc_val in auroc_summary.items():
+        print(f"{split} AUROC: {auc_val:.4f}")
+
+    print("\nALL DONE.")

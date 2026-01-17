@@ -2,3 +2,35 @@
 python -m Pyro4.naming --port 9091
 
 ngrok tcp 9091
+
+
+# Required Package installation
+pip install catboost
+pip install split-folders
+pip install ConfigSpace
+pip install hpbandster
+
+#Nmme server configuration steps
+
+import Pyro4
+
+# Put your ngrok host + port here
+NGROK_HOST = "0.tcp.in.ngrok.io"
+NGROK_PORT = 16172
+
+Pyro4.config.NS_HOST = NGROK_HOST
+Pyro4.config.NS_PORT = NGROK_PORT
+
+print(f"Trying to reach Pyro4 NameServer via ngrok at {NGROK_HOST}:{NGROK_PORT}...\n")
+
+try:
+    ns = Pyro4.locateNS()
+    print("✅ SUCCESS: Connected to remote Pyro4 NameServer!")
+
+    print("\nRegistered objects:")
+    for name, uri in ns.list().items():
+        print(f" - {name}: {uri}")
+
+except Exception as e:
+    print("❌ FAILED: Could not connect to the NameServer.")
+    print("Error:", e)

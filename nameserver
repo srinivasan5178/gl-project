@@ -1,0 +1,4 @@
+#  Connect the name server using ngrok - local machine to colab
+python -m Pyro4.naming --port 9091
+
+ngrok tcp 9091
